@@ -175,7 +175,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 
 <script type="module">
 // ---------------- 設定 ----------------
-const APP_VERSION = "v1.8.0";
+const APP_VERSION = "v1.9.0";
 const VER = "0.10.14";
 const LIB = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const WASM = `${LIB}/wasm`;
@@ -569,24 +569,30 @@ const gOf = G => [G.gx, G.gy, G.dgx ?? 0, G.dgy ?? 0];
 /* 特徴量（定数項なし）。各項がおおよそ ±1〜3 になるように尺度をそろえている
    0-1 左右・上下 / 2-4 端の縮み（3次）と斜め / 5-6 顔の角度 /
    7-10 顔の角度×目線（傾けたときの感度・縮み方の変化） / 11-13 画面内の回転とその×目線 / 14-16 距離とその×目線 /
-   17-18 左右の目の推定位置の差（斜視・片目が動きにくい等：学習で良い方の目に重みが移る） */
-const ADAPT_K = 19;
+   17-18 左右の目の推定位置の差（斜視・片目が動きにくい等：学習で良い方の目に重みが移る） /
+   19 縦の2乗（下を見るほど強く縮むなど、上下で非対称な縮み） */
+const ADAPT_K = 20;
 function adaptFeat(g, hp, env) {
-  const u = g[0], v = g[1] - env.vc, un = u / 3, vn = v / 6;
+  // 曲線の項（3次・2乗・掛け合わせ）は画面の範囲の外では値を固定する。
+  // 固定しないと、学習した範囲の外で曲線が曲がり戻り「外を見るほど推定点が内側へ戻る」ことがある。
+  // 範囲外では左右・上下の1次の項だけが効くので、外を見るほど素直に外へ進む。
+  const hw = env.W / env.ppc / 2, hh = env.H / env.ppc / 2;
+  const u0 = g[0], v0 = g[1] - env.vc, u = clamp(u0, -hw, hw), v = clamp(v0, -hh, hh), un = u / 3, vn = v / 6;
   const ya = hp[0] * 10, pa = hp[1] * 10, ro = (hp[2] ?? 0) * 10, dd = ((hp[3] ?? 35) - 35) / 5;
-  return [u, v, u ** 3 / 9, v ** 3 / 36, u * v / 4, ya, pa,
+  return [u0, v0, u ** 3 / 9, v ** 3 / 36, u * v / 4, ya, pa,
     ya * un, ya * vn, pa * un, pa * vn,
     ro, ro * un, ro * vn,
     dd, dd * un, dd * vn,
-    g[2] ?? 0, g[3] ?? 0];
+    g[2] ?? 0, g[3] ?? 0,
+    vn * vn];
 }
 function adaptPrior(env) {
   const p = env.ppc, Z = Array(12).fill(0);
   // 事前の幅（px／単位）：組み合わせの項は小さめ＝データが少ないうちはほとんど効かない
   const sdTail = [20, 20, 20, 20, 60, 20, 20, 40, 20, 20];
   return {
-    x: { b: [p, 0, 0, 0, 0, 0, 0, ...Z], sd: [0.5 * p, 0.2 * p, 15, 15, 15, 150, 150, ...sdTail, 0.4 * p, 0.15 * p], i: env.W / 2 },
-    y: { b: [0, p, 0, 0, 0, 0, 0, ...Z], sd: [0.2 * p, 0.5 * p, 15, 15, 15, 150, 150, ...sdTail, 0.15 * p, 0.4 * p], i: env.H / 2 },
+    x: { b: [p, 0, 0, 0, 0, 0, 0, ...Z, 0], sd: [0.6 * p, 0.2 * p, 40, 25, 25, 150, 150, ...sdTail, 0.4 * p, 0.15 * p, 25], i: env.W / 2 },
+    y: { b: [0, p, 0, 0, 0, 0, 0, ...Z, 0], sd: [0.2 * p, 0.6 * p, 25, 40, 25, 150, 150, ...sdTail, 0.15 * p, 0.4 * p, 60], i: env.H / 2 },
   };
 }
 function ridgePrior(rows, ys, ws, b0, sd, noise) {
@@ -649,7 +655,12 @@ function loadPool() {
 }
 let pool = loadPool(), adapt = null;
 let session = Date.now();
-function refitAdaptive() { adapt = fitAdaptive(pool, screenEnv(), session); }
+function refitAdaptive() {
+  adapt = fitAdaptive(pool, screenEnv(), session);
+  // 端の基準は、同じセッション（同じ持ち方）の新しいデータを優先
+  const cur = pool.filter(s => s.sid === session);
+  refs = typeof edgeRefs === "function" ? edgeRefs((cur.length >= 4 ? cur : pool).slice(-60), gridBox()) : null;
+}
 function addSamples(list) {
   const last = pool.at(-1);
   if (last && Date.now() - last.t > ADAPT.newSessionGap && last.sid === session) session = Date.now(); // 長く空いたら新しいセッション
@@ -687,9 +698,14 @@ function learnFromGaze(i, t) {
   pendingLearn = null;
   if (est !== "geo") return;
   const r = rects[i]; if (!r) return;
-  const s = sampleFromBuffer(obsBuf, t - dwellMs * 0.8, t - 50, openRef);
+  const t0 = t - dwellMs * 0.8, t1 = t - 50;
+  const dec = learnDecision(obsBuf.filter(o => o.t >= t0 && o.t <= t1), r);
+  if (!dec) return;
+  const s = sampleFromBuffer(obsBuf, t0, t1, openRef);
   if (!s) return;
-  const [added] = addSamples([{ ...s, x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2, src: "gaze", w: ADAPT.gazeW }]);
+  // 端の補正を掛ける前の座標で覚える（補正と学習が二重に効かないように）
+  const [lx, ly] = unBoost(dec.center, boost, boardCenter());
+  const [added] = addSamples([{ ...s, x: lx, y: ly, src: "gaze", w: dec.w }]);
   pendingLearn = { id: added.id, t, act: cells[i].act };
 }
 // 直前の学習が誤選択だったか：文字を入れた直後の「⌫」、行を開いた直後の「◀ 戻る」
@@ -699,7 +715,66 @@ function checkUndo(c) {
   const undo = (p.act === "char" && c.act === "bs") || (p.act === "go" && c.act === "go" && c.val?.type === "main");
   if (undo) removeSample(p.id);
 }
-function resetLearning() { pool = []; store.set(poolKey(), null); session = Date.now(); refitAdaptive(); }
+function resetLearning() { pool = []; store.set(poolKey(), null); session = Date.now(); refitAdaptive(); resetBoost(); }
+
+// ---------------- 端の補正（画面の外側を見続けたら、その方向の感度を徐々に上げる） ----------------
+/* 届かないマスがあると、人は画面の外側まで目を向けて押そうとする。
+   学習前の幾何の注視点（学習のずれに引きずられない）が画面の外側にある間、その方向（左右上下ごと）の倍率を少しずつ上げる。
+   外を見なくなると、ゆっくり 1 に戻る。倍率はボードの中心から外向きに掛ける。 */
+const BOOST = { rate: 0.08, max: 1.6, decay: 0.003, margin: 0.4 }; // 倍率/秒, 上限, 戻る速さ/秒, 画面外とみなす余裕(cm)
+const boostKey = () => `edgeBoost_${eyeMode}`;
+const BOOST1 = { L: 1, R: 1, U: 1, D: 1 };
+let boost = { ...BOOST1, ...(store.get(boostKey()) || {}) }, boostSaveT = 0;
+/* 「外側を見ている」の基準：その人が端の列・段のマスを見ていたときの値（起動時の5点や学習データから）。
+   直近約0.5秒の中央値が、端のマスを見たときの値より列・段の間隔の6割以上外側なら「力んで外を見ている」とみなす。
+   （目を大きく動かすほど値が小さく出る人でも判定できる）。基準がまだない方向は、物理的な画面の端で判定する。 */
+function edgeRefs(samples, box, cols = COLS, rows = ROWS) {
+  if (!samples.length || !box) return null;
+  const cwid = (box.right - box.left) / cols, chei = (box.bottom - box.top) / rows;
+  const col = s => Math.floor((s.x - box.left) / cwid), row = s => Math.floor((s.y - box.top) / chei);
+  const med = (arr, k) => arr.length ? medianVec(arr.map(s => [s.g[k]]))[0] : null;
+  const L = med(samples.filter(s => col(s) <= 0), 0), R = med(samples.filter(s => col(s) >= cols - 1), 0);
+  const U = med(samples.filter(s => row(s) <= 0), 1), D = med(samples.filter(s => row(s) >= rows - 1), 1);
+  return { L, R, U, D, sx: L !== null && R !== null ? (R - L) / (cols - 1) : null, sy: U !== null && D !== null ? (D - U) / (rows - 1) : null };
+}
+function strainSides(G, env, camY, refs = null) {
+  const hw = env.W / env.ppc / 2, top = camY, bot = camY + env.H / env.ppc, m = BOOST.margin;
+  const st = { L: G.gx < -hw - m, R: G.gx > hw + m, U: G.gy < top - m, D: G.gy > bot + m };
+  if (refs?.sx > 0.05) { st.L ||= G.gx < refs.L - 0.6 * refs.sx; st.R ||= G.gx > refs.R + 0.6 * refs.sx; }
+  if (refs?.sy > 0.05) { st.U ||= G.gy < refs.U - 0.6 * refs.sy; st.D ||= G.gy > refs.D + 0.6 * refs.sy; }
+  return st;
+}
+let refs = null; const strainBuf = [];
+function gridBox() { return rects.length ? { left: Math.min(...rects.map(r => r.left)), right: Math.max(...rects.map(r => r.right)), top: Math.min(...rects.map(r => r.top)), bottom: Math.max(...rects.map(r => r.bottom)) } : null; }
+function stepBoost(b, st, dt) {
+  const nb = { ...b };
+  for (const k of "LRUD") nb[k] = st[k] ? Math.min(BOOST.max, b[k] + BOOST.rate * dt) : Math.max(1, b[k] - BOOST.decay * dt);
+  return nb;
+}
+function applyBoost([x, y], b, c) { return [c[0] + (x - c[0]) * (x < c[0] ? b.L : b.R), c[1] + (y - c[1]) * (y < c[1] ? b.U : b.D)]; }
+function unBoost([x, y], b, c) { return [c[0] + (x - c[0]) / (x < c[0] ? b.L : b.R), c[1] + (y - c[1]) / (y < c[1] ? b.U : b.D)]; }
+function boardCenter() {
+  if (!rects.length) return [innerWidth / 2, innerHeight / 2];
+  return [rects.reduce((a, r) => a + (r.left + r.right) / 2, 0) / rects.length, rects.reduce((a, r) => a + (r.top + r.bottom) / 2, 0) / rects.length];
+}
+function resetBoost() { boost = { ...BOOST1 }; store.set(boostKey(), boost); }
+
+/* 学習してよい選択か：
+   ・力んで画面の外側を見ていた時間が3割未満（外を見て押した＝「外を見る＝端のマス」と覚えると感度が下がる悪循環になる）
+   ・選択までの推定点（中央値）が、選ばれたマスの中か、外でも1マス分以内
+   重みは、推定点がマスの中心に近いほど大きい（縁で半分、マスの外は3割〜0） */
+function learnDecision(win, rect) {
+  const ok = win.filter(o => o.p);
+  if (ok.length < 4) return null;
+  const pm = medianVec(ok.map(o => o.p));
+  const cx = (rect.left + rect.right) / 2, cy = (rect.top + rect.bottom) / 2;
+  let n = Math.max(Math.abs(pm[0] - cx) / (rect.width / 2), Math.abs(pm[1] - cy) / (rect.height / 2));
+  if (!isFinite(n)) n = 0;
+  if (n > 3) return null;
+  if (ok.filter(o => o.strain).length > ok.length * 0.3) return null;
+  const k = n <= 1 ? 1 - 0.5 * n : 0.3 * (3 - n) / 2;
+  return k > 0.02 ? { w: ADAPT.gazeW * k, center: [cx, cy] } : null;
+}
 
 // ---------------- 視線 → 選択 ----------------
 function setHot(idx, p) {
@@ -725,9 +800,20 @@ function onGaze(F, G, t) {
   jitPush(jit.raw, x, y);
   x = mx.push(x); y = my.push(y);
   [x, y] = applyTune(fx.filter(x, t / 1000), fy.filter(y, t / 1000));
-  jitPush(jit.out, x, y);
-  x = clamp(x, 0, innerWidth); y = clamp(y, 0, innerHeight);
   const paused = tuning || measuring;
+  // 端の補正：画面の外側を見続けている方向の倍率を上げる
+  if (G.ok) { strainBuf.push([G.gx, G.gy]); if (strainBuf.length > 15) strainBuf.shift(); }
+  const sm = strainBuf.length >= 5 ? medianVec(strainBuf) : null;   // 1フレームの揺れで誤判定しないよう中央値で
+  const st = sm ? strainSides({ gx: sm[0], gy: sm[1] }, screenEnv(), geo.camY) : BOOST1;
+  if (!paused && est === "geo") {
+    boost = stepBoost(boost, st, dt / 1000);
+    if (t - boostSaveT > 2000) { store.set(boostKey(), boost); boostSaveT = t; }
+  }
+  if (est === "geo") [x, y] = applyBoost([x, y], boost, boardCenter());
+  jitPush(jit.out, x, y);
+  const last = obsBuf.at(-1);
+  if (last && last.t === t) { last.p = [x, y]; last.strain = st.L || st.R || st.U || st.D; }
+  x = clamp(x, 0, innerWidth); y = clamp(y, 0, innerHeight);
   if (showDot || paused) placeDot(dotEl, x, y);
   if (paused || t < lockUntil || !gazeReady()) { dwell.p = 0; dwell.idx = null; setHot(null, 0); return; }
   const idx = cellAtSticky(x, y, dwell.idx);
@@ -753,6 +839,7 @@ const fmtLR = (rad, l = "左", r = "右") => { const d = rad * DEG; return `${Ma
 const fmtUD = (rad, u = "上", d = "下") => { const v = rad * DEG; return `${Math.abs(v) < 0.5 ? "正面" : (v > 0 ? u : d)} ${Math.abs(v).toFixed(1)}°`; };
 
 const fmtJ = v => isNaN(v) ? "—" : Math.round(v);
+const boostText = () => `左×${boost.L.toFixed(2)} 右×${boost.R.toFixed(2)} 上×${boost.U.toFixed(2)} 下×${boost.D.toFixed(2)}`;
 // 今の視線・姿勢から、顔を5°傾ける／5cm近づけると推定位置が何pxずれるか（学習した補正分）
 function learnedEffects(G) {
   if (!G?.ok) return "—";
@@ -775,6 +862,7 @@ function drawMeasure(G, t) {
     ["距離", `${G.D.toFixed(1)} cm`],
     ["顔の向き", `${fmtLR(G.yaw)}／${fmtUD(G.pitch)}`],
     ["左右の目", G.eyes ? `重み 左${Math.round(G.eyes.L.w * 100)}%・右${Math.round(G.eyes.R.w * 100)}%／推定位置の差 横${G.dgx.toFixed(1)}cm 縦${G.dgy.toFixed(1)}cm` : "—"],
+    ["端の補正", boostText() + (lastG && G.ok && Object.values(strainSides(G, screenEnv(), geo.camY)).some(v => v) ? "（画面の外を見ています→補正中）" : "")],
     ["学習した傾きの影響", adapt ? learnedEffects(G) : "—"],
     ["学習データ", adapt ? `見つめて選択 ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}` : "—"],
     ["顔の傾き", `${fmtLR(G.roll, "時計回り", "反時計回り")}`],
@@ -1051,7 +1139,7 @@ segment($("estSeg"), ["geo", "reg"], ["自動学習（幾何）", "回帰（要�
 });
 segment($("dwellSeg"), DWELLS, DWELLS.map(v => `${v / 1000}秒`), () => dwellMs, v => { dwellMs = Number(v); store.set("dwellMs", dwellMs); });
 segment($("eyeSeg"), ["auto", "L", "R"], ["両目（自動）", "左目だけ", "右目だけ"], () => eyeMode, v => {
-  eyeMode = v; store.set("eyeMode", eyeMode); pool = loadPool(); session = Date.now(); refitAdaptive(); resetFilters(); stab.reset();
+  eyeMode = v; store.set("eyeMode", eyeMode); pool = loadPool(); boost = { ...BOOST1, ...(store.get(boostKey()) || {}) }; session = Date.now(); refitAdaptive(); resetFilters(); stab.reset();
   toast(pool.length ? `この設定の学習（${adapt.nTap}件）に切り替えました` : "この設定ではまだ学習がありません。「再調整」か、使いながら学習します");
 });
 segment($("smoothSeg"), SMOOTH.map((_, i) => i), SMOOTH.map(o => o.name), () => smoothLv, v => {
@@ -1079,7 +1167,7 @@ $("learnReset").onclick = () => { // 誤タップ防止に2回押しで実行
   setTimeout(() => { $("learnReset").textContent = "学習をリセット"; }, 3000);
 };
 function updateLearnInfo() {
-  $("learnInfo").textContent = adapt ? `見つめて選択 ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}。持ち方や場所が大きく変わってずれる場合はリセットしてください。` : "";
+  $("learnInfo").textContent = adapt ? `端の補正 ${boostText()}／見つめて選択 ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}。持ち方や場所が大きく変わってずれる場合はリセットしてください。` : "";
 }
 $("tuneReset").onclick = () => { tune = { ...TUNE_DEF }; store.set("tune", tune); syncTune(); };
 function afterPanel() { lockUntil = performance.now() + 600; if (!showDot && !tuning && !measuring) dotEl.style.display = "none"; }
@@ -1116,7 +1204,7 @@ syncTune();
 renderMsg(); render(); refitAdaptive();
 
 // テスト用に公開
-window.__gaze = { fitAdaptive, predictAdaptive, adaptFeat, sampleFromBuffer, screenEnv, ADAPT, addSamples, getAdapt: () => adapt, gazeReady, learnFromGaze, checkUndo, removeSample, recordObs, getPool: () => pool, fitAll, geoFeat, medianVec, PoseStabilizer, SMOOTH, jitStd, cellAtSticky, getRects: () => rects, applyTune, getTune: () => tune, fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features, geometry, geoToCss, drawMeasure,
+window.__gaze = { edgeRefs, getObsBuf: () => obsBuf, strainSides, stepBoost, applyBoost, unBoost, learnDecision, BOOST, getBoost: () => boost, fitAdaptive, predictAdaptive, adaptFeat, sampleFromBuffer, screenEnv, ADAPT, addSamples, getAdapt: () => adapt, gazeReady, learnFromGaze, checkUndo, removeSample, recordObs, getPool: () => pool, fitAll, geoFeat, medianVec, PoseStabilizer, SMOOTH, jitStd, cellAtSticky, getRects: () => rects, applyTune, getTune: () => tune, fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features, geometry, geoToCss, drawMeasure,
   setMeasuring, setModel: m => { model = m; mode = "board"; }, onGaze };
 </script>
 </body>
