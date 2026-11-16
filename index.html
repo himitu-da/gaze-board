@@ -22,8 +22,22 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 #preview{width:58px;height:58px;flex:0 0 58px;object-fit:cover;border-radius:10px;transform:scaleX(-1);background:#000;border:3px solid #444}
 #preview.ok{border-color:#2ecc71}#preview.ng{border-color:#e74c3c}
 #ctrl{display:flex;gap:6px;align-items:center;font-size:12px;color:#aab}
-#ctrl button{font:inherit;color:var(--fg);background:var(--cell);border:1px solid var(--cell-b);border-radius:8px;padding:6px 9px}
-#status{margin-left:auto;white-space:nowrap}
+#ctrl button{font:inherit;color:var(--fg);background:var(--cell);border:1px solid var(--cell-b);border-radius:8px;padding:6px 8px;white-space:nowrap}
+#status{margin-left:auto;white-space:pre-line;text-align:right;line-height:1.25;font-size:11px}
+.ver{color:#7f8aa3;font-size:13px;font-weight:400}
+#tune{position:fixed;left:0;right:0;bottom:0;z-index:60;display:none;background:rgba(15,17,21,.95);border-top:1px solid var(--cell-b);
+  padding:12px 16px calc(12px + env(safe-area-inset-bottom));font-size:15px}
+#tune.show{display:block}
+#tune .row{display:flex;align-items:center;gap:10px;margin:6px 0}
+#tune .row label{flex:0 0 7.5em}
+#tune .row b{flex:0 0 3.6em;text-align:right;font-variant-numeric:tabular-nums}
+#tune input[type=range]{flex:1;height:34px;accent-color:var(--acc)}
+#tune .chk{gap:22px}
+#tune .chk label{flex:none;display:flex;align-items:center;gap:6px}
+#tune .chk input{width:22px;height:22px}
+#tune .btns button{flex:1;font:inherit;color:var(--fg);background:var(--cell);border:1px solid var(--cell-b);border-radius:10px;padding:10px}
+#tune .btns button.pri{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:700}
+#tune .hint{margin:4px 0 0;color:#99a;font-size:12px}
 #grid{flex:1;display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);gap:8px;padding:8px}
 .cell{position:relative;overflow:hidden;background:var(--cell);border:3px solid var(--cell-b);border-radius:16px;
   display:flex;align-items:center;justify-content:center;text-align:center;font-size:clamp(18px,6.2vw,36px);font-weight:700;padding:4px;--p:0}
@@ -67,8 +81,9 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
     </div>
     <div id="ctrl">
       <button id="recalBtn">再調整</button>
-      <button id="dotBtn">視線点: 表示</button>
-      <button id="dwellBtn">選択: 1.2秒</button>
+      <button id="tuneBtn">⚙ 感度</button>
+      <button id="dotBtn">点:表示</button>
+      <button id="dwellBtn">1.2秒</button>
       <span id="status">-</span>
     </div>
   </div>
@@ -76,8 +91,18 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 </div>
 <div id="dot"></div>
 
+<div id="tune">
+  <div class="row"><label>左右の感度</label><input type="range" id="tGx" min="0.5" max="3" step="0.1"><b id="tGxV"></b></div>
+  <div class="row"><label>上下の感度</label><input type="range" id="tGy" min="0.5" max="3" step="0.1"><b id="tGyV"></b></div>
+  <div class="row"><label>左右の位置</label><input type="range" id="tOx" min="-30" max="30" step="1"><b id="tOxV"></b></div>
+  <div class="row"><label>上下の位置</label><input type="range" id="tOy" min="-30" max="30" step="1"><b id="tOyV"></b></div>
+  <div class="row chk"><label><input type="checkbox" id="tFx">左右反転</label><label><input type="checkbox" id="tFy">上下反転</label></div>
+  <div class="row btns"><button id="tuneReset">初期値に戻す</button><button id="tuneClose" class="pri">閉じる</button></div>
+  <p class="hint">赤い点（視線）が見ている場所に重なるように調整してください。開いている間は選択されません。<br>感度：大きくすると点がよく動きます／位置：点全体をずらします。</p>
+</div>
+
 <div id="start" class="screen show">
-  <h1>視線入力ボード</h1>
+  <h1>視線入力ボード <span class="ver" id="verStart"></span></h1>
   <ul>
     <li>明るい場所で、スマホを顔の正面 30〜40cm に<b>固定</b>してください（スタンドや物に立てかける）。</li>
     <li>調整では、頭を動かさずに<b>赤い点を目だけで</b>追ってください。</li>
@@ -98,6 +123,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 
 <script type="module">
 // ---------------- 設定 ----------------
+const APP_VERSION = "v1.1.0";
 const VER = "0.10.14";
 const LIB = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const WASM = `${LIB}/wasm`;
@@ -248,6 +274,17 @@ const fx = new OneEuro(0.5, 0.003), fy = new OneEuro(0.5, 0.003);
 const dwell = { idx: null, p: 0 }; let lockUntil = 0, lastT = 0;
 let faceOk = false, frames = 0, fpsT = performance.now(), fps = 0;
 let collecting = null; // キャリブレーション中のサンプル配列
+const TUNE_DEF = { gx: 1, gy: 1, ox: 0, oy: 0, flipX: false, flipY: false };
+let tune = { ...TUNE_DEF, ...(store.get("tune") || {}) }, tuning = false;
+
+// 感度・位置・反転の補正。中心はキャリブレーション点の中心（＝ボードの中心）
+function applyTune(x, y) {
+  const cx = model?.cx ?? innerWidth / 2, cy = model?.cy ?? innerHeight / 2;
+  let dx = (x - cx) * tune.gx, dy = (y - cy) * tune.gy;
+  if (tune.flipX) dx = -dx;
+  if (tune.flipY) dy = -dy;
+  return [cx + dx + tune.ox / 100 * innerWidth, cy + dy + tune.oy / 100 * innerHeight];
+}
 
 function toast(text, ms = 3000) {
   const t = $("toast"); t.textContent = text; t.classList.add("show");
@@ -318,10 +355,10 @@ function onGaze(F, t) {
   const dt = Math.min(120, t - lastT); lastT = t;
   if (F.open < model.openBase * 0.45) return; // 瞬き中は保持
   let [x, y] = predict(model, F.f);
-  x = clamp(fx.filter(x, t / 1000), 0, innerWidth);
-  y = clamp(fy.filter(y, t / 1000), 0, innerHeight);
-  if (showDot) { dotEl.style.display = "block"; dotEl.style.transform = `translate(${x}px,${y}px)`; }
-  if (t < lockUntil) { dwell.p = 0; setHot(null, 0); return; }
+  [x, y] = applyTune(fx.filter(x, t / 1000), fy.filter(y, t / 1000));
+  x = clamp(x, 0, innerWidth); y = clamp(y, 0, innerHeight);
+  if (showDot || tuning) { dotEl.style.display = "block"; dotEl.style.transform = `translate(${x}px,${y}px)`; }
+  if (tuning || t < lockUntil) { dwell.p = 0; dwell.idx = null; setHot(null, 0); return; }
   const idx = cellAt(x, y);
   if (idx !== null && idx === dwell.idx) dwell.p += dt;
   else { dwell.p -= dt * 1.5; if (dwell.p <= 0) { dwell.idx = idx; dwell.p = 0; } }
@@ -356,7 +393,7 @@ function loop() {
   const lm = res.faceLandmarks?.[0];
   faceOk = !!lm && lm.length >= 478;
   video.className = faceOk ? "ok" : "ng";
-  $("status").textContent = `${faceOk ? "顔:OK" : "顔:未検出"} ${fps}fps`;
+  $("status").textContent = `${APP_VERSION}\n${faceOk ? "顔OK" : "顔なし"} ${fps}fps`;
   if (!faceOk) return onNoFace(t);
   const F = features(lm, video.videoWidth, video.videoHeight);
   if (mode === "calib" && collecting && F.open > 0.08) collecting.push(F.f);
@@ -401,7 +438,11 @@ async function calibrate() {
   model = fitModel(samples);
   model.openBase = opens.reduce((a, b) => a + b, 0) / opens.length;
   model.w = innerWidth; model.h = innerHeight;
+  model.cx = centers.reduce((s, c) => s + c[0], 0) / centers.length;
+  model.cy = centers.reduce((s, c) => s + c[1], 0) / centers.length;
   const err = samples.reduce((s, o) => { const [px, py] = predict(model, o.f); return s + Math.hypot(px - o.x, py - o.y); }, 0) / samples.length;
+  // 調整し直したら感度補正はリセット（新しいモデルには前の補正が合わないため）
+  if (JSON.stringify(tune) !== JSON.stringify(TUNE_DEF)) { tune = { ...TUNE_DEF }; store.set("tune", tune); syncTune(); }
   store.set("gazeModel", model);
   const cellMin = Math.min(rects[0].width, rects[0].height);
   toast(`調整完了：平均誤差 約${Math.round(err)}px` + (err > cellMin * 0.4 ? "（大きめです。再調整をおすすめします）" : ""), 4000);
@@ -445,13 +486,36 @@ function savedModel() {
 
 // ---------------- UI ----------------
 function updateCtrl() {
-  $("dotBtn").textContent = `視線点: ${showDot ? "表示" : "非表示"}`;
-  $("dwellBtn").textContent = `選択: ${dwellMs / 1000}秒`;
-  if (!showDot) dotEl.style.display = "none";
+  $("dotBtn").textContent = `点:${showDot ? "表示" : "非表示"}`;
+  $("dwellBtn").textContent = `${dwellMs / 1000}秒`;
+  if (!showDot && !tuning) dotEl.style.display = "none";
 }
+
+// 感度パネル
+const TUNE_UI = [["tGx", "gx", v => `×${v.toFixed(1)}`], ["tGy", "gy", v => `×${v.toFixed(1)}`],
+  ["tOx", "ox", v => `${v > 0 ? "+" : ""}${v}%`], ["tOy", "oy", v => `${v > 0 ? "+" : ""}${v}%`]];
+function syncTune() {
+  for (const [id, k, fmt] of TUNE_UI) { $(id).value = tune[k]; $(id + "V").textContent = fmt(tune[k]); }
+  $("tFx").checked = tune.flipX; $("tFy").checked = tune.flipY;
+}
+for (const [id, k, fmt] of TUNE_UI) $(id).addEventListener("input", e => {
+  tune[k] = Number(e.target.value); $(id + "V").textContent = fmt(tune[k]); store.set("tune", tune);
+});
+$("tFx").onchange = e => { tune.flipX = e.target.checked; store.set("tune", tune); };
+$("tFy").onchange = e => { tune.flipY = e.target.checked; store.set("tune", tune); };
+$("tuneReset").onclick = () => { tune = { ...TUNE_DEF }; store.set("tune", tune); syncTune(); };
+function setTuning(on) {
+  tuning = on; $("tune").classList.toggle("show", on);
+  if (!on) { lockUntil = performance.now() + 600; updateCtrl(); }
+}
+$("tuneBtn").onclick = () => setTuning(!tuning);
+$("tuneClose").onclick = () => setTuning(false);
+$("verStart").textContent = APP_VERSION;
+$("status").textContent = APP_VERSION;
+syncTune();
 $("startBtn").onclick = () => boot(false);
 $("resumeBtn").onclick = () => boot(true);
-$("recalBtn").onclick = () => { if (mode === "board") calibrate(); };
+$("recalBtn").onclick = () => { if (mode === "board") { setTuning(false); calibrate(); } };
 $("dotBtn").onclick = () => { showDot = !showDot; store.set("showDot", showDot); updateCtrl(); };
 $("dwellBtn").onclick = () => { dwellMs = DWELLS[(DWELLS.indexOf(dwellMs) + 1) % DWELLS.length]; store.set("dwellMs", dwellMs); updateCtrl(); };
 addEventListener("resize", () => {
@@ -463,7 +527,7 @@ if (savedModel()) $("resumeBtn").style.display = "";
 updateCtrl(); renderMsg(); render();
 
 // テスト用に公開
-window.__gaze = { fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features };
+window.__gaze = { applyTune, getTune: () => tune, fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features };
 </script>
 </body>
 </html>
