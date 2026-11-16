@@ -86,7 +86,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 #target::after{content:"";position:absolute;left:50%;top:50%;width:6px;height:6px;margin:-3px;border-radius:50%;background:#fff}
 #target.collect{animation:shrink 1.2s linear forwards}
 @keyframes shrink{to{transform:scale(.4)}}
-#calibMsg{position:fixed;left:0;right:0;top:calc(8px + env(safe-area-inset-top));color:#999;font-size:13px;text-align:center;pointer-events:none}
+#calibMsg{position:fixed;left:0;right:0;top:43%;color:#bbb;font-size:14px;line-height:1.6;text-align:center;pointer-events:none;white-space:pre-line;padding:0 16px}
 #toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#222a;backdrop-filter:blur(6px);
   -webkit-backdrop-filter:blur(6px);border:1px solid #444;color:#fff;padding:10px 14px;border-radius:12px;font-size:14px;z-index:200;
   max-width:90vw;text-align:center;opacity:0;transition:opacity .3s;pointer-events:none;white-space:pre-line}
@@ -121,6 +121,9 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
   <div class="row"><label>左右の位置</label><input type="range" id="tOx" min="-30" max="30" step="1"><b id="tOxV"></b></div>
   <div class="row"><label>上下の位置</label><input type="range" id="tOy" min="-30" max="30" step="1"><b id="tOyV"></b></div>
   <div class="row chk"><label><input type="checkbox" id="tFx">左右反転</label><label><input type="checkbox" id="tFy">上下反転</label></div>
+  <h3>ブレ補正</h3>
+  <div class="row"><div class="seg" id="smoothSeg"></div></div>
+  <p class="hint">強いほど点が安定しますが、動きへの追従が少し遅れます。</p>
   <h3>表示・選択</h3>
   <div class="row chk"><label><input type="checkbox" id="tDot">視線の点を表示</label></div>
   <div class="row"><label>選択までの時間</label><div class="seg" id="dwellSeg"></div></div>
@@ -145,7 +148,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
   <h1>視線入力ボード <span class="ver" id="verStart"></span></h1>
   <ul>
     <li>明るい場所で、スマホを<b>縦向き</b>で顔の正面 30〜40cm に<b>固定</b>してください（スタンドや物に立てかける）。</li>
-    <li>調整では、頭を動かさずに<b>赤い点を目だけで</b>追ってください。</li>
+    <li>調整では、頭を動かさずに<b>赤い点を目だけで</b>追います（四隅も含む13点）。最後に、中央の点を見たまま<b>顔をゆっくり左右・上下に</b>動かします。</li>
     <li>ボタンを見つめると選択されます。上の文字欄を見ている間は何も選ばれません。</li>
     <li>「📐 計測」で顔の角度・距離・視線の向きを確認できます。</li>
     <li>映像は端末内だけで処理され、どこにも送信されません。</li>
@@ -164,7 +167,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 
 <script type="module">
 // ---------------- 設定 ----------------
-const APP_VERSION = "v1.2.0";
+const APP_VERSION = "v1.4.0";
 const VER = "0.10.14";
 const LIB = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const WASM = `${LIB}/wasm`;
@@ -175,6 +178,14 @@ const FLOOR = [.02, .02, .02, .02, .03, .03, .03, .03, .01]; // 特徴量ごと�
 const IRIS_CM = 1.17;  // 虹彩の直径（ほぼ個人差なし）
 const EYE_R_CM = 1.2;  // 眼球の回転半径
 const GEO_DEF = { fov: 70, screenW: 7.0, camY: 1.0 };
+// ブレ補正の強さ：minCut/beta＝注視点の平滑化、pose/dist＝頭の姿勢・距離の平滑化係数（小さいほど強い）
+const SMOOTH = [
+  { name: "弱", minCut: 0.8, beta: 0.004, pose: 0.35, dist: 0.2 },
+  { name: "中", minCut: 0.4, beta: 0.002, pose: 0.25, dist: 0.12 },
+  { name: "強", minCut: 0.2, beta: 0.0012, pose: 0.15, dist: 0.08 },
+  { name: "最強", minCut: 0.1, beta: 0.0007, pose: 0.08, dist: 0.04 },
+];
+const STICKY = 0.15; // 見ているマスから外れたと判定するまでの余裕（マスの大きさに対する割合）
 
 const $ = id => document.getElementById(id);
 const video = $("preview"), grid = $("grid"), dotEl = $("dot"), dot2El = $("dot2"), msgEl = $("msg");
@@ -216,40 +227,65 @@ function features(lm, vw, vh) {
   };
 }
 
+// 頭の姿勢・距離・目の位置はゆっくり変わるので、目の回転とは別に指数平滑する（ブレ対策）
+class PoseStabilizer {
+  constructor() { this.reset(); }
+  reset() { this.s = null; }
+  step(m, aPose, aDist) {
+    if (!this.s) { this.s = { ax: m.ax, ay: m.ay, D: m.D, em: m.em }; return this.s; }
+    const s = this.s, mix = (a, b, k) => a.map((v, i) => v + k * (b[i] - v));
+    // 変化が小さい（ノイズ）ときは強く平滑し、大きく動いたら（姿勢 2→8°、距離 3→12%）すぐ追従する
+    const ang = Math.acos(clamp(Math.min(dotv(s.ax, m.ax), dotv(s.ay, m.ay)), -1, 1)) * DEG;
+    const rel = Math.abs(m.D - s.D) / s.D;
+    const kp = aPose + (1 - aPose) * clamp((ang - 2) / 6, 0, 1);
+    const kd = aDist + (1 - aDist) * clamp((rel - 0.03) / 0.09, 0, 1);
+    s.ax = norm3(mix(s.ax, m.ax, kp)); s.ay = norm3(mix(s.ay, m.ay, kp));
+    s.D += kd * (m.D - s.D); s.em = mix(s.em, m.em, kp);
+    return s;
+  }
+}
+
 /* 幾何モデル：顔の姿勢・距離・眼球の回転から3Dの視線を作り、スマホの画面平面との交点を求める。
    カメラ座標系：原点＝インカメラ、X＝映像の右（＝ユーザーの左）、Y＝上、Z＝カメラ→ユーザーの逆向き（顔は Z=-D）。
    画面平面は Z=0。返す注視点はユーザーから見た向き（右が+、カメラから下が+、単位cm）。 */
-function geometry(lm, vw, vh, geo) {
+const AX_PAIRS = [[33, 263], [133, 362], [234, 454], [61, 291]];      // 映像の左→右（目尻・目頭・頬・口角）
+const EYE_R_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
+const EYE_L_CONTOUR = [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466];
+const AY_PAIRS = [[152, 10], [199, 9], [17, 168]];                     // 下→上（あご→額 など）
+function geometry(lm, vw, vh, geo, stab = null, smooth = SMOOTH[2]) {
   const P2 = i => [lm[i].x * vw, lm[i].y * vh];
   const P3 = i => [lm[i].x * vw, -lm[i].y * vh, -lm[i].z * vw];
-  // 顔の座標軸（右目尻→左目尻、あご→額、その外積＝顔の正面方向）
-  const ax = norm3(sub3(P3(263), P3(33)));
-  let ay = norm3(sub3(P3(10), P3(152)));
+  const sumPairs = pairs => pairs.reduce((acc, [a, b]) => acc.map((v, k) => v + sub3(P3(b), P3(a))[k]), [0, 0, 0]);
+  // 顔の座標軸：複数の点の組を合計してノイズを減らす
+  let ax = norm3(sumPairs(AX_PAIRS)), ay = norm3(sumPairs(AY_PAIRS));
+  // 距離：虹彩の見かけの直径から（横向きで縮むので縦横の大きい方）
+  const fpx = (Math.max(vw, vh) / 2) / Math.tan(geo.fov / 2 / DEG);
+  const irisPx = c => Math.max(len(sub(P2(c + 1), P2(c + 3))), len(sub(P2(c + 2), P2(c + 4))));
+  const dpx = (irisPx(468) + irisPx(473)) / 2;
+  let D = fpx * IRIS_CM / dpx, em = mid(P2(468), P2(473));
+  if (stab) ({ ax, ay, D, em } = stab.step({ ax, ay, D, em }, smooth.pose, smooth.dist));
   const fwd = norm3(cross(ax, ay));
   ay = norm3(cross(fwd, ax));
   const yaw = Math.atan2(fwd[0], fwd[2]);                        // +：ユーザーの左を向く
   const pitch = Math.atan2(fwd[1], Math.hypot(fwd[0], fwd[2]));  // +：上を向く
   const roll = Math.atan2(ax[1], ax[0]);                         // +：映像で右上がり
-  // 距離：虹彩の見かけの直径から（横向きで縮むので縦横の大きい方）
-  const fpx = (Math.max(vw, vh) / 2) / Math.tan(geo.fov / 2 / DEG);
-  const irisPx = c => Math.max(len(sub(P2(c + 1), P2(c + 3))), len(sub(P2(c + 2), P2(c + 4))));
-  const dpx = (irisPx(468) + irisPx(473)) / 2;
-  const D = fpx * IRIS_CM / dpx;
-  // 眼球の回転：目頭・目尻の中点からの虹彩のずれ ÷ 眼球半径(px)
-  function eyeOff(L, R, I) {
+  // 眼球の回転：目頭・目尻の中点からの虹彩のずれ ÷ 眼球半径(px)（眼球半径は平滑後の距離から）
+  // 虹彩の中心は5点（中心＋周囲4点）の平均、目の左右の中心は輪郭16点の平均でノイズを減らす
+  const avg = ids => ids.map(P2).reduce((a, p) => [a[0] + p[0] / ids.length, a[1] + p[1] / ids.length], [0, 0]);
+  function eyeOff(L, R, I, contour) {
     const l = P2(L), r = P2(R), c = mid(l, r), w = len(sub(r, l));
     const u = [(r[0] - l[0]) / w, (r[1] - l[1]) / w], v = [-u[1], u[0]];
-    const d = sub(P2(I), c);
-    return [dot2(d, u), dot2(d, v)];
+    const iris = avg([I, I + 1, I + 2, I + 3, I + 4]);
+    const d = sub(iris, c), dc = sub(avg(contour), c);
+    return [dot2(d, u) - dot2(dc, u), dot2(d, v)];
   }
-  const ea = eyeOff(33, 133, 468), eb = eyeOff(362, 263, 473);
-  const Rpx = EYE_R_CM * dpx / IRIS_CM;
+  const ea = eyeOff(33, 133, 468, EYE_R_CONTOUR), eb = eyeOff(362, 263, 473, EYE_L_CONTOUR);
+  const Rpx = EYE_R_CM * fpx / D;
   const sx = clamp((ea[0] + eb[0]) / 2 / Rpx, -0.95, 0.95);      // +：映像の右（ユーザーの左）
   const sy = clamp((ea[1] + eb[1]) / 2 / Rpx, -0.95, 0.95);      // +：下
   const cz = Math.sqrt(Math.max(0.05, 1 - sx * sx - sy * sy));
   const g = [0, 1, 2].map(k => sx * ax[k] - sy * ay[k] + cz * fwd[k]);
   // 目の3D位置（両目の虹彩の中点）
-  const em = mid(P2(468), P2(473));
   const E = [(em[0] - vw / 2) * D / fpx, -(em[1] - vh / 2) * D / fpx, -D];
   // 画面平面 Z=0 との交点
   const ok = g[2] > 0.05;
@@ -284,18 +320,18 @@ function normalize(m, f) { return f.map((v, i) => clamp((v - m.mean[i]) / m.std[
 
 // リッジ回帰で 特徴量 → 画面座標(x, y) を学習
 function fitModel(samples, lambdaRatio = 0.02, floor = FLOOR) {
-  const d = samples[0].f.length, n = samples.length;
+  const d = samples[0].f.length, n = samples.reduce((a, s) => a + (s.w ?? 1), 0); // n＝重みの合計
   const mean = Array(d).fill(0), std = Array(d).fill(0);
-  for (const s of samples) s.f.forEach((v, i) => mean[i] += v / n);
-  for (const s of samples) s.f.forEach((v, i) => std[i] += (v - mean[i]) ** 2 / n);
+  for (const s of samples) s.f.forEach((v, i) => mean[i] += (s.w ?? 1) * v / n);
+  for (const s of samples) s.f.forEach((v, i) => std[i] += (s.w ?? 1) * (v - mean[i]) ** 2 / n);
   for (let i = 0; i < d; i++) std[i] = Math.max(Math.sqrt(std[i]), floor[i] ?? 0.01);
   const m = { mean, std };
   const D = d + 1, A = Array.from({ length: D }, () => Array(D).fill(0)), bx = Array(D).fill(0), by = Array(D).fill(0);
   for (const s of samples) {
-    const z = [1, ...normalize(m, s.f)];
+    const z = [1, ...normalize(m, s.f)], w = s.w ?? 1;
     for (let i = 0; i < D; i++) {
-      bx[i] += z[i] * s.x; by[i] += z[i] * s.y;
-      for (let j = 0; j < D; j++) A[i][j] += z[i] * z[j];
+      bx[i] += w * z[i] * s.x; by[i] += w * z[i] * s.y;
+      for (let j = 0; j < D; j++) A[i][j] += w * z[i] * z[j];
     }
   }
   for (let i = 1; i < D; i++) A[i][i] += lambdaRatio * n;
@@ -368,8 +404,30 @@ let message = "";
 let dwellMs = store.get("dwellMs") || 1200, showDot = store.get("showDot") ?? true;
 let est = store.get("est") || "geo";
 let geo = { ...GEO_DEF, ...(store.get("geo") || {}) };
-const fx = new OneEuro(0.5, 0.003), fy = new OneEuro(0.5, 0.003);
-const gfx = new OneEuro(0.5, 0.003), gfy = new OneEuro(0.5, 0.003);
+let smoothLv = clamp(store.get("smooth") ?? 2, 0, SMOOTH.length - 1);
+let fx, fy, gfx, gfy;
+function makeFilters() {
+  const S = SMOOTH[smoothLv];
+  fx = new OneEuro(S.minCut, S.beta); fy = new OneEuro(S.minCut, S.beta);
+  gfx = new OneEuro(S.minCut, S.beta); gfy = new OneEuro(S.minCut, S.beta);
+}
+makeFilters();
+const stab = new PoseStabilizer();
+class Median { // 一瞬だけ跳ねた値（外れ値）を除く
+  constructor(n = 5) { this.n = n; this.b = []; }
+  reset() { this.b = []; }
+  push(v) { this.b.push(v); if (this.b.length > this.n) this.b.shift(); const s = [...this.b].sort((a, b) => a - b); return s[s.length >> 1]; }
+}
+const mx = new Median(), my = new Median();
+// ブレの計測：直近約1秒の点のばらつき（標準偏差, px）
+const jit = { raw: [], out: [] };
+function jitPush(arr, x, y) { arr.push([x, y]); if (arr.length > 30) arr.shift(); }
+function jitStd(arr) {
+  if (arr.length < 10) return NaN;
+  const m = [0, 1].map(k => arr.reduce((s, p) => s + p[k], 0) / arr.length);
+  return Math.sqrt(arr.reduce((s, p) => s + (p[0] - m[0]) ** 2 + (p[1] - m[1]) ** 2, 0) / arr.length);
+}
+function resetFilters() { fx.reset(); fy.reset(); mx.reset(); my.reset(); jit.raw = []; jit.out = []; }
 const dwell = { idx: null, p: 0 }; let lockUntil = 0, lastT = 0;
 let faceOk = false, frames = 0, fpsT = performance.now(), fps = 0;
 let collecting = null; // キャリブレーション中のサンプル配列
@@ -416,6 +474,13 @@ function render() {
   measure();
 }
 function measure() { rects = [...grid.children].map(el => el.getBoundingClientRect()); }
+function cellAtSticky(x, y, cur) {
+  if (cur !== null && rects[cur]) {
+    const r = rects[cur], mx = r.width * STICKY, my = r.height * STICKY;
+    if (x >= r.left - mx && x <= r.right + mx && y >= r.top - my && y <= r.bottom + my) return cur;
+  }
+  return cellAt(x, y);
+}
 function cellAt(x, y) {
   for (let i = 0; i < rects.length; i++) {
     const r = rects[i];
@@ -454,7 +519,7 @@ function setHot(idx, p) {
 function placeDot(el, x, y) { el.style.display = "block"; el.style.transform = `translate(${x}px,${y}px)`; }
 
 function rawPoint(F, G) {
-  if (est === "geo" && model.geo && G.ok) return [dotv([1, G.gx, G.gy], model.geo.wx), dotv([1, G.gx, G.gy], model.geo.wy)];
+  if (est === "geo" && model.geo?.mean && G.ok) return predict(model.geo, geoFeat([G.gx, G.gy], [G.yaw, G.pitch]));
   return predict(model, F.f);
 }
 
@@ -462,12 +527,15 @@ function onGaze(F, G, t) {
   const dt = Math.min(120, t - lastT); lastT = t;
   if (F.open < model.openBase * 0.45) return; // 瞬き中は保持
   let [x, y] = rawPoint(F, G);
+  jitPush(jit.raw, x, y);
+  x = mx.push(x); y = my.push(y);
   [x, y] = applyTune(fx.filter(x, t / 1000), fy.filter(y, t / 1000));
+  jitPush(jit.out, x, y);
   x = clamp(x, 0, innerWidth); y = clamp(y, 0, innerHeight);
   const paused = tuning || measuring;
   if (showDot || paused) placeDot(dotEl, x, y);
   if (paused || t < lockUntil) { dwell.p = 0; dwell.idx = null; setHot(null, 0); return; }
-  const idx = cellAt(x, y);
+  const idx = cellAtSticky(x, y, dwell.idx);
   if (idx !== null && idx === dwell.idx) dwell.p += dt;
   else { dwell.p -= dt * 1.5; if (dwell.p <= 0) { dwell.idx = idx; dwell.p = 0; } }
   setHot(dwell.idx, dwell.p / dwellMs);
@@ -485,6 +553,7 @@ function onNoFace(t) {
 const fmtLR = (rad, l = "左", r = "右") => { const d = rad * DEG; return `${Math.abs(d) < 0.5 ? "正面" : (d > 0 ? l : r)} ${Math.abs(d).toFixed(1)}°`; };
 const fmtUD = (rad, u = "上", d = "下") => { const v = rad * DEG; return `${Math.abs(v) < 0.5 ? "正面" : (v > 0 ? u : d)} ${Math.abs(v).toFixed(1)}°`; };
 
+const fmtJ = v => isNaN(v) ? "—" : Math.round(v);
 function drawMeasure(G, t) {
   if (!measuring || t - (drawMeasure.t || 0) < 66) return; // 約15fps
   drawMeasure.t = t;
@@ -500,6 +569,7 @@ function drawMeasure(G, t) {
     ["顔の傾き", `${fmtLR(G.roll, "時計回り", "反時計回り")}`],
     ["目の回転", `${fmtLR(G.eyeH)}／${fmtUD(-G.eyeV)}`],
     ["視線（合計）", `${fmtLR(gazeYaw)}／${fmtUD(gazePitch)}`],
+    ["ブレ（1秒）", model ? `補正前 ±${fmtJ(jitStd(jit.raw))}px → 平滑後 ±${fmtJ(jitStd(jit.out))}px（${SMOOTH[smoothLv].name}）` : "調整後に表示"],
     ["注視点", G.ok ? `横 ${G.gx >= 0 ? "+" : ""}${G.gx.toFixed(1)}cm・カメラから下 ${G.gy.toFixed(1)}cm（${inScreen ? "画面内" : "画面外"}）` : "画面の方を向いていません"],
   ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 
@@ -560,16 +630,16 @@ function loop() {
   faceOk = !!lm && lm.length >= 478;
   video.className = faceOk ? "ok" : "ng";
   $("status").textContent = `${APP_VERSION}\n${faceOk ? "顔OK" : "顔なし"} ${fps}fps`;
-  if (!faceOk) { lastG = null; drawMeasure(null, t); dot2El.style.display = "none"; return onNoFace(t); }
+  if (!faceOk) { lastG = null; stab.reset(); drawMeasure(null, t); dot2El.style.display = "none"; return onNoFace(t); }
   const vw = video.videoWidth, vh = video.videoHeight;
-  const F = features(lm, vw, vh), G = geometry(lm, vw, vh, geo);
+  const F = features(lm, vw, vh), G = geometry(lm, vw, vh, geo, stab, SMOOTH[mode === "calib" ? 0 : smoothLv]);
   lastG = G;
   if (measuring && G.ok) {
     const [x, y] = geoToCss(G, geo);
     placeDot(dot2El, clamp(gfx.filter(x, t / 1000), 0, innerWidth), clamp(gfy.filter(y, t / 1000), 0, innerHeight));
   } else dot2El.style.display = "none";
   drawMeasure(G, t);
-  if (mode === "calib" && collecting && F.open > 0.08) collecting.push({ f: F.f, g: G.ok ? [G.gx, G.gy] : null });
+  if (mode === "calib" && collecting && F.open > 0.08) collecting.push({ f: F.f, g: G.ok ? [G.gx, G.gy] : null, hp: [G.yaw, G.pitch] });
   else if (mode === "board" && model) onGaze(F, G, t);
 }
 
@@ -585,56 +655,99 @@ async function waitFace(label) {
   }
 }
 
-// 幾何モデルの出力(cm) → 画面px のアフィン補正（個人差・画面位置のずれを吸収）
-function fitGeo(samples) {
-  const s = samples.filter(o => o.g);
-  if (s.length < 20) return null;
-  const m = fitModel(s.map(o => ({ f: o.g, x: o.x, y: o.y })), 0.001, [0.05, 0.05]);
-  // 正規化を展開して [1, gx, gy] の係数にする
-  const unfold = w => { const a = w[1] / m.std[0], b = w[2] / m.std[1]; return [w[0] - a * m.mean[0] - b * m.mean[1], a, b]; };
-  return { wx: unfold(m.wx), wy: unfold(m.wy) };
+// 幾何モデルの補正：注視点(cm)に加え、端での縮みを補う3次の項と、顔の角度によるずれを補う項を使う
+const geoFeat = (g, hp) => [g[0], g[1], g[0] ** 3, g[1] ** 3, g[0] * g[1], hp[0], hp[1]];
+const GEO_FLOOR = [0.05, 0.05, 0.2, 0.2, 0.1, 0.02, 0.02];
+const HEAD_WEIGHT = 4; // 「顔を動かす」サンプル全体の重み（調整点 何点分か）
+
+function medianVec(arr) {
+  const d = arr[0].length;
+  return Array.from({ length: d }, (_, k) => { const s = arr.map(a => a[k]).sort((a, b) => a - b); return s[s.length >> 1]; });
+}
+
+/* points：各調整点の中央値（ノイズを平均してから当てはめるので、傾きが小さく見積もられない）
+   head  ：中央の点を見たまま顔を動かしたサンプル（顔の角度とずれの関係を学習する） */
+function fitAll(points, head = []) {
+  const wHead = head.length ? HEAD_WEIGHT / head.length : 0;
+  const all = [...points.map(p => ({ ...p, w: 1 })), ...head.map(h => ({ ...h, w: wHead }))];
+  const reg = fitModel(all.map(s => ({ f: s.f, x: s.x, y: s.y, w: s.w })));
+  const gs = all.filter(s => s.g && s.hp);
+  const geo = gs.filter(s => s.w === 1).length >= 6
+    ? fitModel(gs.map(s => ({ f: geoFeat(s.g, s.hp), x: s.x, y: s.y, w: s.w })), 0.002, GEO_FLOOR) : null;
+  return { reg, geo };
+}
+
+async function collectHead(x, y) {
+  const msg = $("calibMsg"), scr = $("calib");
+  let skip = false; scr.onclick = () => { skip = true; };
+  collecting = [];
+  const t0 = performance.now();
+  while (true) {
+    const el = performance.now() - t0, hp = collecting.map(o => o.hp);
+    const rng = k => hp.length ? (Math.max(...hp.map(h => h[k])) - Math.min(...hp.map(h => h[k]))) * DEG : 0;
+    const ry = rng(0), rp = rng(1);
+    msg.textContent = `点を見つめたまま、顔をゆっくり左右・上下に動かしてください\n左右 ${Math.min(ry, 99).toFixed(0)}/15°　上下 ${Math.min(rp, 99).toFixed(0)}/10°（タップでスキップ）`;
+    if ((el > 3000 && ry >= 15 && rp >= 10) || el > 12000 || skip) break;
+    await wait(100);
+  }
+  scr.onclick = null;
+  const out = (collecting || []).filter(o => o.g).map(o => ({ ...o, x, y }));
+  collecting = null;
+  return out;
 }
 
 async function calibrate() {
   mode = "calib"; dotEl.style.display = "none";
   view = view.type === "kana" ? { type: "kanaG", page: 0 } : view; render();
   const centers = rects.map(r => [(r.left + r.right) / 2, (r.top + r.bottom) / 2]);
+  const inset = Math.max(24, Math.min(innerWidth, innerHeight) * 0.06);
+  const corners = [[inset, inset], [innerWidth - inset, inset], [innerWidth - inset, innerHeight - inset], [inset, innerHeight - inset]];
+  const targets = [...SNAKE.map(i => centers[i]), ...corners];
   const scr = $("calib"), tg = $("target"), msg = $("calibMsg");
+  const moveTo = ([x, y]) => { tg.classList.remove("collect"); tg.style.left = x + "px"; tg.style.top = y + "px"; };
   scr.classList.add("show");
-  tg.style.transition = "none"; tg.style.left = centers[SNAKE[0]][0] + "px"; tg.style.top = centers[SNAKE[0]][1] + "px";
-  void tg.offsetWidth; tg.style.transition = "";
+  tg.style.transition = "none"; moveTo(targets[0]); void tg.offsetWidth; tg.style.transition = "";
   await waitFace("頭を動かさず、赤い点を目で追ってください");
-  const samples = [], opens = [];
-  for (let k = 0; k < SNAKE.length; k++) {
-    const [x, y] = centers[SNAKE[k]];
-    tg.classList.remove("collect"); tg.style.left = x + "px"; tg.style.top = y + "px";
-    msg.textContent = `赤い点を見てください（${k + 1}/${SNAKE.length}）`;
+  const points = [];
+  for (let k = 0; k < targets.length; k++) {
+    const [x, y] = targets[k];
+    moveTo(targets[k]);
+    msg.textContent = `頭を動かさず、赤い点を目で見てください（${k + 1}/${targets.length + 1}）`;
     await wait(750);                         // 移動＋視線の到達待ち
     tg.classList.add("collect"); collecting = [];
     const t0 = performance.now();
     while (collecting.length < 30 && performance.now() - t0 < 5000) await wait(40);
     const got = trimSamples(collecting, 0.7, o => o.f); collecting = null;
     if (got.length < 5) { k--; await waitFace("顔が見つかりません。カメラに顔を映してください"); continue; }
-    got.forEach(o => { samples.push({ f: o.f, g: o.g, x, y }); opens.push(o.f[2]); });
+    const gg = got.filter(o => o.g);
+    points.push({ f: medianVec(got.map(o => o.f)), g: gg.length >= 3 ? medianVec(gg.map(o => o.g)) : null,
+      hp: medianVec(got.map(o => o.hp)), x, y });
   }
+  // 最後：中央の点を見たまま顔を動かす
+  const cx = centers.reduce((s, c) => s + c[0], 0) / centers.length, cy = centers.reduce((s, c) => s + c[1], 0) / centers.length;
+  moveTo([cx, cy]);
+  msg.textContent = `赤い点を見つめてください（${targets.length + 1}/${targets.length + 1}）`;
+  await wait(900);
+  const head = await collectHead(cx, cy);
   scr.classList.remove("show"); tg.classList.remove("collect");
-  model = fitModel(samples);
-  model.geo = fitGeo(samples);
-  model.openBase = opens.reduce((a, b) => a + b, 0) / opens.length;
-  model.w = innerWidth; model.h = innerHeight;
-  model.cx = centers.reduce((s, c) => s + c[0], 0) / centers.length;
-  model.cy = centers.reduce((s, c) => s + c[1], 0) / centers.length;
-  const errOf = fn => { const v = samples.map(fn).filter(e => e !== null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : NaN; };
-  const errReg = errOf(o => { const [px, py] = predict(model, o.f); return Math.hypot(px - o.x, py - o.y); });
-  const errGeo = model.geo ? errOf(o => o.g ? Math.hypot(dotv([1, ...o.g], model.geo.wx) - o.x, dotv([1, ...o.g], model.geo.wy) - o.y) : null) : NaN;
+
+  const fit = fitAll(points, head);
+  model = fit.reg; model.geo = fit.geo; model.ver = 3;
+  model.openBase = points.reduce((a, p) => a + p.f[2], 0) / points.length;
+  model.w = innerWidth; model.h = innerHeight; model.cx = cx; model.cy = cy;
+  const errOf = fn => { const v = points.map(fn).filter(e => e !== null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : NaN; };
+  const errReg = errOf(p => { const [px, py] = predict(model, p.f); return Math.hypot(px - p.x, py - p.y); });
+  const errGeo = model.geo ? errOf(p => { if (!p.g) return null; const [px, py] = predict(model.geo, geoFeat(p.g, p.hp)); return Math.hypot(px - p.x, py - p.y); }) : NaN;
   // 調整し直したら感度補正はリセット（新しいモデルには前の補正が合わないため）
   if (JSON.stringify(tune) !== JSON.stringify(TUNE_DEF)) { tune = { ...TUNE_DEF }; store.set("tune", tune); syncTune(); }
   store.set("gazeModel", model);
   const cellMin = Math.min(rects[0].width, rects[0].height);
   const cur = est === "geo" && model.geo ? errGeo : errReg;
+  const hpRange = k => head.length ? (Math.max(...head.map(h => h.hp[k])) - Math.min(...head.map(h => h.hp[k]))) * DEG : 0;
   toast(`調整完了（平均誤差）\n回帰 約${Math.round(errReg)}px／幾何 ${isNaN(errGeo) ? "—" : "約" + Math.round(errGeo) + "px"}` +
-    (cur > cellMin * 0.4 ? "\n誤差が大きめです。再調整をおすすめします" : ""), 5000);
-  fx.reset(); fy.reset(); lastT = performance.now(); lockUntil = lastT + 800;
+    (cur > cellMin * 0.4 ? "\n誤差が大きめです。再調整をおすすめします" : "") +
+    (hpRange(0) < 8 ? "\n顔の動きが小さかったため、傾けたときの補正は弱めです" : ""), 5500);
+  resetFilters(); lastT = performance.now(); lockUntil = lastT + 800;
   mode = "board";
 }
 
@@ -669,7 +782,7 @@ async function boot(useSaved) {
 
 function savedModel() {
   const m = store.get("gazeModel");
-  return m && Math.abs(m.w - innerWidth) < 40 && Math.abs(m.h - innerHeight) < 80 ? m : null;
+  return m && m.ver === 3 && Math.abs(m.w - innerWidth) < 40 && Math.abs(m.h - innerHeight) < 80 ? m : null;
 }
 
 // ---------------- UI ----------------
@@ -680,10 +793,13 @@ function segment(el, values, labels, get, set) {
   sync(); return sync;
 }
 segment($("estSeg"), ["reg", "geo"], ["回帰（従来）", "幾何モデル"], () => est, v => {
-  if (v === "geo" && model && !model.geo) { toast("幾何モデルを使うには「再調整」が必要です"); }
-  est = v; store.set("est", est); fx.reset(); fy.reset();
+  if (v === "geo" && model && !model.geo?.mean) { toast("幾何モデルを使うには「再調整」が必要です"); }
+  est = v; store.set("est", est); resetFilters();
 });
 segment($("dwellSeg"), DWELLS, DWELLS.map(v => `${v / 1000}秒`), () => dwellMs, v => { dwellMs = Number(v); store.set("dwellMs", dwellMs); });
+segment($("smoothSeg"), SMOOTH.map((_, i) => i), SMOOTH.map(o => o.name), () => smoothLv, v => {
+  smoothLv = Number(v); store.set("smooth", smoothLv); makeFilters(); resetFilters();
+});
 $("tDot").checked = showDot;
 $("tDot").onchange = e => { showDot = e.target.checked; store.set("showDot", showDot); if (!showDot && !tuning && !measuring) dotEl.style.display = "none"; };
 
@@ -734,7 +850,7 @@ if (savedModel()) $("resumeBtn").style.display = "";
 renderMsg(); render();
 
 // テスト用に公開
-window.__gaze = { applyTune, getTune: () => tune, fitModel, fitGeo, predict, trimSamples, cycleLast, cellsFor, OneEuro, features, geometry, geoToCss, drawMeasure,
+window.__gaze = { fitAll, geoFeat, medianVec, PoseStabilizer, SMOOTH, jitStd, cellAtSticky, getRects: () => rects, applyTune, getTune: () => tune, fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features, geometry, geoToCss, drawMeasure,
   setMeasuring, setModel: m => { model = m; mode = "board"; }, onGaze };
 </script>
 </body>
