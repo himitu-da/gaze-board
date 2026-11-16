@@ -172,7 +172,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 
 <script type="module">
 // ---------------- 設定 ----------------
-const APP_VERSION = "v1.6.0";
+const APP_VERSION = "v1.7.0";
 const VER = "0.10.14";
 const LIB = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const WASM = `${LIB}/wasm`;
@@ -530,12 +530,27 @@ const ADAPT = {
 };
 function screenEnv() { const ppc = innerWidth / geo.screenW; return { W: innerWidth, H: innerHeight, ppc, vc: geo.camY + innerHeight / ppc / 2 }; }
 // 形の特徴量（定数項なし）：左右・上下・端の縮み（3次）・斜め・顔の角度
-function adaptFeat(g, hp, env) { const u = g[0], v = g[1] - env.vc; return [u, v, u ** 3 / 9, v ** 3 / 36, u * v / 4, hp[0] * 10, hp[1] * 10]; }
+// hp ＝ [顔の左右角度, 上下角度]（カメラ→目の視線に対する相対角, rad）, 画面内の回転(rad), 距離(cm)
+const hpOf = G => [G.rel[0], G.rel[1], G.roll, G.D];
+/* 特徴量（定数項なし）。各項がおおよそ ±1〜3 になるように尺度をそろえている
+   0-1 左右・上下 / 2-4 端の縮み（3次）と斜め / 5-6 顔の角度 /
+   7-10 顔の角度×目線（傾けたときの感度・縮み方の変化） / 11-13 画面内の回転とその×目線 / 14-16 距離とその×目線 */
+const ADAPT_K = 17;
+function adaptFeat(g, hp, env) {
+  const u = g[0], v = g[1] - env.vc, un = u / 3, vn = v / 6;
+  const ya = hp[0] * 10, pa = hp[1] * 10, ro = (hp[2] ?? 0) * 10, dd = ((hp[3] ?? 35) - 35) / 5;
+  return [u, v, u ** 3 / 9, v ** 3 / 36, u * v / 4, ya, pa,
+    ya * un, ya * vn, pa * un, pa * vn,
+    ro, ro * un, ro * vn,
+    dd, dd * un, dd * vn];
+}
 function adaptPrior(env) {
-  const p = env.ppc;
+  const p = env.ppc, Z = Array(10).fill(0);
+  // 事前の幅（px／単位）：組み合わせの項は小さめ＝データが少ないうちはほとんど効かない
+  const sdTail = [20, 20, 20, 20, 60, 20, 20, 40, 20, 20];
   return {
-    x: { b: [p, 0, 0, 0, 0, 0, 0], sd: [0.5 * p, 0.2 * p, 15, 15, 15, 150, 150], i: env.W / 2 },
-    y: { b: [0, p, 0, 0, 0, 0, 0], sd: [0.2 * p, 0.5 * p, 15, 15, 15, 150, 150], i: env.H / 2 },
+    x: { b: [p, 0, 0, 0, 0, 0, 0, ...Z], sd: [0.5 * p, 0.2 * p, 15, 15, 15, 150, 150, ...sdTail], i: env.W / 2 },
+    y: { b: [0, p, 0, 0, 0, 0, 0, ...Z], sd: [0.2 * p, 0.5 * p, 15, 15, 15, 150, 150, ...sdTail], i: env.H / 2 },
   };
 }
 function ridgePrior(rows, ys, ws, b0, sd, noise) {
@@ -548,7 +563,7 @@ function ridgePrior(rows, ys, ws, b0, sd, noise) {
   return solve(A, r);
 }
 function fitAdaptive(pool, env, curSid) {
-  const pr = adaptPrior(env), K = 7;
+  const pr = adaptPrior(env), K = ADAPT_K;
   const taps = pool.filter(s => s.src !== "cal");
   const info = { n: pool.length, nTap: taps.length, cells: new Set(taps.map(s => `${Math.round(s.x)},${Math.round(s.y)}`)).size,
     hasCal: pool.some(s => s.src === "cal") };
@@ -618,7 +633,7 @@ let openRef = null;
 function recordObs(t, F, G) {
   openRef = openRef === null ? F.open : (F.open > openRef * 0.6 ? openRef + 0.02 * (F.open - openRef) : openRef);
   if (!G.ok) return;
-  obsBuf.push({ t, g: [G.gx, G.gy], hp: G.rel, open: F.open });
+  obsBuf.push({ t, g: [G.gx, G.gy], hp: hpOf(G), open: F.open });
   while (obsBuf.length && obsBuf[0].t < t - 3000) obsBuf.shift();
 }
 // 時刻 t0〜t1 の視線の中央値。揺れていた・瞬きしていた場合は null（学習しない）
@@ -662,7 +677,7 @@ function placeDot(el, x, y) { el.style.display = "block"; el.style.transform = `
 
 function rawPoint(F, G) {
   if (est === "reg" && model) return predict(model, F.f);
-  if (G.ok && adapt) return predictAdaptive(adapt, [G.gx, G.gy], G.rel, screenEnv());
+  if (G.ok && adapt) return predictAdaptive(adapt, [G.gx, G.gy], hpOf(G), screenEnv());
   return null;
 }
 
@@ -702,6 +717,15 @@ const fmtLR = (rad, l = "左", r = "右") => { const d = rad * DEG; return `${Ma
 const fmtUD = (rad, u = "上", d = "下") => { const v = rad * DEG; return `${Math.abs(v) < 0.5 ? "正面" : (v > 0 ? u : d)} ${Math.abs(v).toFixed(1)}°`; };
 
 const fmtJ = v => isNaN(v) ? "—" : Math.round(v);
+// 今の視線・姿勢から、顔を5°傾ける／5cm近づけると推定位置が何pxずれるか（学習した補正分）
+function learnedEffects(G) {
+  if (!G?.ok) return "—";
+  const env = screenEnv(), g = [G.gx, G.gy], hp = hpOf(G), base = predictAdaptive(adapt, g, hp, env);
+  const d = (k, dv) => { const h = [...hp]; h[k] += dv; const p = predictAdaptive(adapt, g, h, env); return [p[0] - base[0], p[1] - base[1]]; };
+  const f = ([x, y]) => `${x >= 0 ? "→" : "←"}${Math.abs(Math.round(x))} ${y >= 0 ? "↓" : "↑"}${Math.abs(Math.round(y))}px`;
+  const r5 = 5 / DEG;
+  return `左右5°：${f(d(0, r5))}／上下5°：${f(d(1, r5))}<br>回転5°：${f(d(2, r5))}／5cm遠く：${f(d(3, 5))}`;
+}
 function drawMeasure(G, t) {
   if (!measuring || t - (drawMeasure.t || 0) < 66) return; // 約15fps
   drawMeasure.t = t;
@@ -714,6 +738,7 @@ function drawMeasure(G, t) {
   st.innerHTML = [
     ["距離", `${G.D.toFixed(1)} cm`],
     ["顔の向き", `${fmtLR(G.yaw)}／${fmtUD(G.pitch)}`],
+    ["学習した傾きの影響", adapt ? learnedEffects(G) : "—"],
     ["学習データ", adapt ? `見つめて選択 ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}` : "—"],
     ["顔の傾き", `${fmtLR(G.roll, "時計回り", "反時計回り")}`],
     ["目の回転", `${fmtLR(G.eyeH)}／${fmtUD(-G.eyeV)}`],
@@ -789,7 +814,7 @@ function loop() {
   } else dot2El.style.display = "none";
   drawMeasure(G, t);
   recordObs(t, F, G);
-  if (mode === "calib" && collecting && F.open > 0.08) collecting.push({ f: F.f, g: G.ok ? [G.gx, G.gy] : null, hp: G.rel });
+  if (mode === "calib" && collecting && F.open > 0.08) collecting.push({ f: F.f, g: G.ok ? [G.gx, G.gy] : null, hp: hpOf(G) });
   else if (mode === "board") onGaze(F, G, t);
 }
 
