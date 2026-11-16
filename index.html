@@ -127,6 +127,9 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
   <h3>表示・選択</h3>
   <div class="row chk"><label><input type="checkbox" id="tDot">視線の点を表示</label></div>
   <div class="row"><label>選択までの時間</label><div class="seg" id="dwellSeg"></div></div>
+  <h3>自動学習</h3>
+  <div class="row btns"><button id="learnReset">学習をリセット</button></div>
+  <p class="hint" id="learnInfo"></p>
   <div class="row btns"><button id="tuneReset">補正を初期値に</button><button id="tuneClose" class="pri">閉じる</button></div>
   <p class="hint">開いている間は選択されません。赤い点が見ている場所に重なるように調整してください。</p>
 </div>
@@ -148,13 +151,14 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
   <h1>視線入力ボード <span class="ver" id="verStart"></span></h1>
   <ul>
     <li>明るい場所で、スマホを<b>縦向き</b>で顔の正面 30〜40cm に<b>固定</b>してください（スタンドや物に立てかける）。</li>
-    <li>調整では、頭を動かさずに<b>赤い点を目だけで</b>追います（四隅も含む13点）。最後に、中央の点を見たまま<b>顔をゆっくり左右・上下に</b>動かします。</li>
-    <li>ボタンを見つめると選択されます。上の文字欄を見ている間は何も選ばれません。</li>
+    <li><b>調整なしですぐ使えます。</b>ボタンを<b>見ながらタップ</b>すると、そのたびに視線を学習して精度が上がります（電車内でもOK）。数回タップすると、見つめるだけで選べるようになります。</li>
+    <li>落ち着いた場所では「しっかり調整」もできます（13点＋顔を動かす）。結果は自動学習にも使われます。</li>
+    <li>上の文字欄を見ている間は何も選ばれません。</li>
     <li>「📐 計測」で顔の角度・距離・視線の向きを確認できます。</li>
     <li>映像は端末内だけで処理され、どこにも送信されません。</li>
   </ul>
-  <button id="startBtn" class="big">カメラを起動して調整する</button>
-  <button id="resumeBtn" class="big sub" style="display:none">前回の調整で始める</button>
+  <button id="startBtn" class="big">はじめる（使いながら自動調整）</button>
+  <button id="calStartBtn" class="big sub">しっかり調整してから始める</button>
   <div id="err"></div>
 </div>
 
@@ -167,7 +171,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 
 <script type="module">
 // ---------------- 設定 ----------------
-const APP_VERSION = "v1.4.0";
+const APP_VERSION = "v1.5.0";
 const VER = "0.10.14";
 const LIB = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const WASM = `${LIB}/wasm`;
@@ -291,7 +295,9 @@ function geometry(lm, vw, vh, geo, stab = null, smooth = SMOOTH[2]) {
   const ok = g[2] > 0.05;
   const t = ok ? D / g[2] : 0;
   const hit = [E[0] + t * g[0], E[1] + t * g[1]];
-  return { ok, yaw, pitch, roll, D, eyeH: Math.asin(sx), eyeV: Math.asin(sy), E, g, fwd, gx: -hit[0], gy: -hit[1] };
+  // カメラから目への視線に対する顔の角度（黒目と目頭・目尻の奥行き差による見かけのずれはこの角度で決まる）
+  const rel = [yaw + Math.atan2(E[0], D), pitch + Math.atan2(E[1], D)];
+  return { ok, yaw, pitch, roll, D, eyeH: Math.asin(sx), eyeV: Math.asin(sy), E, g, fwd, rel, gx: -hit[0], gy: -hit[1] };
 }
 
 // 幾何モデルの補正前の注視点(cm) → CSS px
@@ -467,7 +473,8 @@ function render() {
     const el = document.createElement("div");
     el.className = "cell " + (c.cls || "");
     el.innerHTML = `<span>${c.label}</span>`;
-    el.addEventListener("pointerup", () => c.act && activate(i)); // タップでも操作可能
+    el.addEventListener("pointerdown", () => c.act && learnFromTap(i)); // タップ＝そこを見ていた → 学習
+    el.addEventListener("pointerup", () => c.act && activate(i));       // タップでも操作可能
     grid.appendChild(el);
   });
   dwell.idx = null; dwell.p = 0;
@@ -508,6 +515,135 @@ function activate(i) {
   lockUntil = performance.now() + 700;
 }
 
+// ---------------- 自動キャリブレーション（タップで学習） ----------------
+/* タップした瞬間はそのボタンの中心を見ていると仮定し、直前の視線データを正解として蓄積する。
+   モデル：幾何モデルの注視点(cm)・顔の角度 → 画面px。
+   ・物理的な初期値（画面幅・カメラ画角から計算）に向けて正則化するので、学習0件でも動き、少数のタップでも暴れない
+   ・形（感度・端の縮み・角度によるずれ）は全データで共有し、位置（切片）は使用セッションごとに持つ
+   ・さらに直近のタップから位置のずれを推定して、持ち替えにすぐ追従する */
+const ADAPT = {
+  noise: 40,        // 1回のタップの想定誤差(px)
+  maxSamples: 120,  // 保存する最大件数
+  halfLife: 40,     // タップの重みが半分になる件数
+  recentN: 6,       // 位置のずれを推定する直近タップ数
+  readyTaps: 8,     // 視線での選択をオンにするタップ数
+  readyCells: 4,    // そのうち異なるボタンの数
+  win: [450, 80],   // タップの何ms前〜何ms前の視線を使うか
+  maxSpread: 2.0,   // その間の視線のばらつき（中央値からの距離の中央値, cm）の上限。超えたら揺れていたとみなして捨てる
+  newSessionGap: 15 * 60 * 1000,
+};
+function screenEnv() { const ppc = innerWidth / geo.screenW; return { W: innerWidth, H: innerHeight, ppc, vc: geo.camY + innerHeight / ppc / 2 }; }
+// 形の特徴量（定数項なし）：左右・上下・端の縮み（3次）・斜め・顔の角度
+function adaptFeat(g, hp, env) { const u = g[0], v = g[1] - env.vc; return [u, v, u ** 3 / 9, v ** 3 / 36, u * v / 4, hp[0] * 10, hp[1] * 10]; }
+function adaptPrior(env) {
+  const p = env.ppc;
+  return {
+    x: { b: [p, 0, 0, 0, 0, 0, 0], sd: [0.5 * p, 0.2 * p, 15, 15, 15, 150, 150], i: env.W / 2 },
+    y: { b: [0, p, 0, 0, 0, 0, 0], sd: [0.2 * p, 0.5 * p, 15, 15, 15, 150, 150], i: env.H / 2 },
+  };
+}
+function ridgePrior(rows, ys, ws, b0, sd, noise) {
+  const d = b0.length, A = Array.from({ length: d }, () => Array(d).fill(0)), r = Array(d).fill(0);
+  rows.forEach((h, n) => {
+    const w = ws[n]; if (!w) return;
+    for (let i = 0; i < d; i++) { if (!h[i]) continue; r[i] += w * h[i] * ys[n]; for (let j = 0; j < d; j++) A[i][j] += w * h[i] * h[j]; }
+  });
+  for (let i = 0; i < d; i++) { const lam = (noise / sd[i]) ** 2; A[i][i] += lam; r[i] += lam * b0[i]; }
+  return solve(A, r);
+}
+function fitAdaptive(pool, env, curSid) {
+  const pr = adaptPrior(env), K = 7;
+  const taps = pool.filter(s => s.src === "tap");
+  const info = { n: pool.length, nTap: taps.length, cells: new Set(taps.map(s => `${Math.round(s.x)},${Math.round(s.y)}`)).size,
+    hasCal: pool.some(s => s.src === "cal") };
+  if (!pool.length) return { sx: pr.x.b, sy: pr.y.b, ix: pr.x.i, iy: pr.y.i, off: [0, 0], ...info };
+  const sids = [...new Set(pool.map(s => s.sid))], S = sids.length, si = new Map(sids.map((s, i) => [s, i]));
+  const rows = pool.map(s => { const r = [...adaptFeat(s.g, s.hp, env), ...Array(S).fill(0)]; r[K + si.get(s.sid)] = 1; return r; });
+  // 重み：タップは新しいほど重い
+  const age = []; for (let i = pool.length - 1, k = 0; i >= 0; i--) age[i] = pool[i].src === "tap" ? k++ : 0;
+  const base = pool.map((s, i) => (s.w ?? 1) * (s.src === "tap" ? Math.pow(0.5, age[i] / ADAPT.halfLife) : 1));
+  const xs = pool.map(s => s.x), ys = pool.map(s => s.y);
+  const b0 = ax => [...pr[ax].b, ...Array(S).fill(pr[ax].i)], sd = ax => [...pr[ax].sd, ...Array(S).fill(300)];
+  let ws = base, bx, by;
+  for (let pass = 0; pass < 2; pass++) {
+    bx = ridgePrior(rows, xs, ws, b0("x"), sd("x"), ADAPT.noise);
+    by = ridgePrior(rows, ys, ws, b0("y"), sd("y"), ADAPT.noise);
+    if (pass === 0 && pool.length >= 8) { // 外れ値（見ずにタップした等）を除いてもう一度
+      const res = rows.map((h, i) => Math.hypot(dotv(h, bx) - xs[i], dotv(h, by) - ys[i]));
+      const med = [...res].sort((a, b) => a - b)[res.length >> 1], lim = Math.max(3 * med, 150);
+      ws = base.map((w, i) => res[i] > lim ? 0 : w);
+    }
+  }
+  // 現在のセッションの位置（なければ他セッションの平均）
+  const cnt = sids.map(s => pool.filter(p => p.sid === s).length), tot = cnt.reduce((a, b) => a + b, 0);
+  const icept = b => si.has(curSid) ? b[K + si.get(curSid)] : sids.reduce((a, s, i) => a + b[K + i] * cnt[i] / tot, 0);
+  const ix = icept(bx), iy = icept(by);
+  // 直近のタップから位置のずれ（持ち替え）を推定：残差の中央値を件数に応じて控えめに
+  const recent = [];
+  for (let i = pool.length - 1; i >= 0 && recent.length < ADAPT.recentN; i--) {
+    const s = pool[i]; if (s.src !== "tap" || s.sid !== curSid) continue;
+    const h = adaptFeat(s.g, s.hp, env);
+    recent.push([s.x - (ix + dotv(h, bx)), s.y - (iy + dotv(h, by))]);
+  }
+  let off = [0, 0];
+  if (recent.length >= 2) { const m = medianVec(recent), k = recent.length / (recent.length + 2); off = [m[0] * k, m[1] * k]; }
+  return { sx: bx.slice(0, K), sy: by.slice(0, K), ix, iy, off, ...info };
+}
+function predictAdaptive(A, g, hp, env) {
+  const h = adaptFeat(g, hp, env);
+  return [A.ix + dotv(h, A.sx) + A.off[0], A.iy + dotv(h, A.sy) + A.off[1]];
+}
+
+// 学習データの保存・読み込み（画面サイズが変わったら使えないので破棄）
+function loadPool() {
+  const p = store.get("adaptPool");
+  return p && Math.abs(p.W - innerWidth) < 40 && Math.abs(p.H - innerHeight) < 200 ? p.samples : [];
+}
+let pool = loadPool(), adapt = null;
+let session = Date.now();
+function refitAdaptive() { adapt = fitAdaptive(pool, screenEnv(), session); }
+function addSamples(list) {
+  const last = pool.filter(s => s.src === "tap").at(-1);
+  if (last && Date.now() - last.t > ADAPT.newSessionGap && last.sid === session) session = Date.now(); // 長く空いたら新しいセッション
+  const wasReady = gazeReady();
+  pool.push(...list.map(s => ({ ...s, sid: session, t: Date.now() })));
+  if (pool.length > ADAPT.maxSamples) pool = pool.slice(-ADAPT.maxSamples);
+  store.set("adaptPool", { W: innerWidth, H: innerHeight, samples: pool });
+  refitAdaptive();
+  if (!wasReady && gazeReady()) toast("視線での選択をオンにしました");
+}
+function gazeReady() {
+  if (est === "reg") return !!model;
+  return !!adapt && (adapt.hasCal || (adapt.nTap >= ADAPT.readyTaps && adapt.cells >= ADAPT.readyCells));
+}
+
+// タップ直前の視線を記録しておくリングバッファ
+const obsBuf = [];
+let openRef = null;
+function recordObs(t, F, G) {
+  openRef = openRef === null ? F.open : (F.open > openRef * 0.6 ? openRef + 0.02 * (F.open - openRef) : openRef);
+  if (!G.ok) return;
+  obsBuf.push({ t, g: [G.gx, G.gy], hp: G.rel, open: F.open });
+  while (obsBuf.length && obsBuf[0].t < t - 1500) obsBuf.shift();
+}
+// タップ時：そのボタンの中心を見ていたとみなして学習。揺れていた・瞬きしていた場合は捨てる
+function sampleFromBuffer(buf, t, ref) {
+  const win = buf.filter(o => o.t >= t - ADAPT.win[0] && o.t <= t - ADAPT.win[1] && (ref === null || o.open > ref * 0.55));
+  if (win.length < 4) return null;
+  const m = medianVec(win.map(o => o.g));
+  const d = win.map(o => Math.hypot(o.g[0] - m[0], o.g[1] - m[1])).sort((a, b) => a - b);
+  if (d[d.length >> 1] > ADAPT.maxSpread) return null;
+  return { g: m, hp: medianVec(win.map(o => o.hp)) };
+}
+function learnFromTap(i) {
+  if (mode !== "board" || tuning || measuring) return;
+  const r = rects[i]; if (!r) return;
+  const s = sampleFromBuffer(obsBuf, performance.now(), openRef);
+  if (!s) return;
+  addSamples([{ ...s, x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2, src: "tap" }]);
+}
+function resetLearning() { pool = []; store.set("adaptPool", null); session = Date.now(); refitAdaptive(); }
+
 // ---------------- 視線 → 選択 ----------------
 function setHot(idx, p) {
   [...grid.children].forEach((el, i) => {
@@ -519,14 +655,16 @@ function setHot(idx, p) {
 function placeDot(el, x, y) { el.style.display = "block"; el.style.transform = `translate(${x}px,${y}px)`; }
 
 function rawPoint(F, G) {
-  if (est === "geo" && model.geo?.mean && G.ok) return predict(model.geo, geoFeat([G.gx, G.gy], [G.yaw, G.pitch]));
-  return predict(model, F.f);
+  if (est === "reg" && model) return predict(model, F.f);
+  if (G.ok && adapt) return predictAdaptive(adapt, [G.gx, G.gy], G.rel, screenEnv());
+  return null;
 }
 
 function onGaze(F, G, t) {
   const dt = Math.min(120, t - lastT); lastT = t;
-  if (F.open < model.openBase * 0.45) return; // 瞬き中は保持
-  let [x, y] = rawPoint(F, G);
+  if (openRef !== null && F.open < openRef * 0.45) return; // 瞬き中は保持
+  const p = rawPoint(F, G); if (!p) return;
+  let [x, y] = p;
   jitPush(jit.raw, x, y);
   x = mx.push(x); y = my.push(y);
   [x, y] = applyTune(fx.filter(x, t / 1000), fy.filter(y, t / 1000));
@@ -534,7 +672,7 @@ function onGaze(F, G, t) {
   x = clamp(x, 0, innerWidth); y = clamp(y, 0, innerHeight);
   const paused = tuning || measuring;
   if (showDot || paused) placeDot(dotEl, x, y);
-  if (paused || t < lockUntil) { dwell.p = 0; dwell.idx = null; setHot(null, 0); return; }
+  if (paused || t < lockUntil || !gazeReady()) { dwell.p = 0; dwell.idx = null; setHot(null, 0); return; }
   const idx = cellAtSticky(x, y, dwell.idx);
   if (idx !== null && idx === dwell.idx) dwell.p += dt;
   else { dwell.p -= dt * 1.5; if (dwell.p <= 0) { dwell.idx = idx; dwell.p = 0; } }
@@ -566,10 +704,11 @@ function drawMeasure(G, t) {
   st.innerHTML = [
     ["距離", `${G.D.toFixed(1)} cm`],
     ["顔の向き", `${fmtLR(G.yaw)}／${fmtUD(G.pitch)}`],
+    ["学習データ", adapt ? `タップ ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}（${gazeReady() ? "視線選択オン" : "視線選択オフ"}）` : "—"],
     ["顔の傾き", `${fmtLR(G.roll, "時計回り", "反時計回り")}`],
     ["目の回転", `${fmtLR(G.eyeH)}／${fmtUD(-G.eyeV)}`],
     ["視線（合計）", `${fmtLR(gazeYaw)}／${fmtUD(gazePitch)}`],
-    ["ブレ（1秒）", model ? `補正前 ±${fmtJ(jitStd(jit.raw))}px → 平滑後 ±${fmtJ(jitStd(jit.out))}px（${SMOOTH[smoothLv].name}）` : "調整後に表示"],
+    ["ブレ（1秒）", jit.raw.length ? `補正前 ±${fmtJ(jitStd(jit.raw))}px → 平滑後 ±${fmtJ(jitStd(jit.out))}px（${SMOOTH[smoothLv].name}）` : "調整後に表示"],
     ["注視点", G.ok ? `横 ${G.gx >= 0 ? "+" : ""}${G.gx.toFixed(1)}cm・カメラから下 ${G.gy.toFixed(1)}cm（${inScreen ? "画面内" : "画面外"}）` : "画面の方を向いていません"],
   ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 
@@ -629,7 +768,7 @@ function loop() {
   const lm = res.faceLandmarks?.[0];
   faceOk = !!lm && lm.length >= 478;
   video.className = faceOk ? "ok" : "ng";
-  $("status").textContent = `${APP_VERSION}\n${faceOk ? "顔OK" : "顔なし"} ${fps}fps`;
+  $("status").textContent = `${APP_VERSION}\n${faceOk ? "顔OK" : "顔なし"} ${fps}fps` + (est === "geo" && adapt ? ` 学習${adapt.nTap}${gazeReady() ? "" : "（タップで学習）"}` : "");
   if (!faceOk) { lastG = null; stab.reset(); drawMeasure(null, t); dot2El.style.display = "none"; return onNoFace(t); }
   const vw = video.videoWidth, vh = video.videoHeight;
   const F = features(lm, vw, vh), G = geometry(lm, vw, vh, geo, stab, SMOOTH[mode === "calib" ? 0 : smoothLv]);
@@ -639,8 +778,9 @@ function loop() {
     placeDot(dot2El, clamp(gfx.filter(x, t / 1000), 0, innerWidth), clamp(gfy.filter(y, t / 1000), 0, innerHeight));
   } else dot2El.style.display = "none";
   drawMeasure(G, t);
-  if (mode === "calib" && collecting && F.open > 0.08) collecting.push({ f: F.f, g: G.ok ? [G.gx, G.gy] : null, hp: [G.yaw, G.pitch] });
-  else if (mode === "board" && model) onGaze(F, G, t);
+  recordObs(t, F, G);
+  if (mode === "calib" && collecting && F.open > 0.08) collecting.push({ f: F.f, g: G.ok ? [G.gx, G.gy] : null, hp: G.rel });
+  else if (mode === "board") onGaze(F, G, t);
 }
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
@@ -733,18 +873,23 @@ async function calibrate() {
 
   const fit = fitAll(points, head);
   model = fit.reg; model.geo = fit.geo; model.ver = 3;
+  // 自動学習の学習データにも加える（調整点は1件ずつ、顔を動かしたデータは間引いて合計4件分の重み）
+  const headSub = head.filter((_, i) => i % Math.max(1, Math.floor(head.length / 20)) === 0).slice(0, 20);
+  addSamples([...points.filter(p => p.g).map(p => ({ g: p.g, hp: p.hp, x: p.x, y: p.y, src: "cal", w: 1 })),
+    ...headSub.map(h => ({ g: h.g, hp: h.hp, x: h.x, y: h.y, src: "cal", w: 4 / Math.max(1, headSub.length) }))]);
   model.openBase = points.reduce((a, p) => a + p.f[2], 0) / points.length;
   model.w = innerWidth; model.h = innerHeight; model.cx = cx; model.cy = cy;
   const errOf = fn => { const v = points.map(fn).filter(e => e !== null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : NaN; };
   const errReg = errOf(p => { const [px, py] = predict(model, p.f); return Math.hypot(px - p.x, py - p.y); });
-  const errGeo = model.geo ? errOf(p => { if (!p.g) return null; const [px, py] = predict(model.geo, geoFeat(p.g, p.hp)); return Math.hypot(px - p.x, py - p.y); }) : NaN;
+  const env = screenEnv();
+  const errGeo = adapt ? errOf(p => { if (!p.g) return null; const [px, py] = predictAdaptive(adapt, p.g, p.hp, env); return Math.hypot(px - p.x, py - p.y); }) : NaN;
   // 調整し直したら感度補正はリセット（新しいモデルには前の補正が合わないため）
   if (JSON.stringify(tune) !== JSON.stringify(TUNE_DEF)) { tune = { ...TUNE_DEF }; store.set("tune", tune); syncTune(); }
   store.set("gazeModel", model);
   const cellMin = Math.min(rects[0].width, rects[0].height);
-  const cur = est === "geo" && model.geo ? errGeo : errReg;
+  const cur = est === "geo" ? errGeo : errReg;
   const hpRange = k => head.length ? (Math.max(...head.map(h => h.hp[k])) - Math.min(...head.map(h => h.hp[k]))) * DEG : 0;
-  toast(`調整完了（平均誤差）\n回帰 約${Math.round(errReg)}px／幾何 ${isNaN(errGeo) ? "—" : "約" + Math.round(errGeo) + "px"}` +
+  toast(`調整完了（平均誤差）\n回帰 約${Math.round(errReg)}px／自動学習 ${isNaN(errGeo) ? "—" : "約" + Math.round(errGeo) + "px"}` +
     (cur > cellMin * 0.4 ? "\n誤差が大きめです。再調整をおすすめします" : "") +
     (hpRange(0) < 8 ? "\n顔の動きが小さかったため、傾けたときの補正は弱めです" : ""), 5500);
   resetFilters(); lastT = performance.now(); lockUntil = lastT + 800;
@@ -755,13 +900,13 @@ let wakeLock = null;
 async function keepAwake() { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {} }
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && mode !== "start") keepAwake(); });
 
-async function boot(useSaved) {
+async function boot(doCalib) {
   const err = $("err"); err.textContent = "";
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
     err.textContent = "カメラを使うには HTTPS で開く必要があります（GitHub Pages などで公開してください）。"; return;
   }
   try { speechSynthesis.speak(new SpeechSynthesisUtterance("")); } catch {} // iOSの読み上げ解禁
-  $("startBtn").disabled = $("resumeBtn").disabled = true;
+  $("startBtn").disabled = $("calStartBtn").disabled = true;
   try {
     err.textContent = "カメラを起動しています…";
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -770,14 +915,20 @@ async function boot(useSaved) {
     if (!landmarker) { err.textContent = "顔検出モデルを読み込んでいます…（初回は数秒かかります）"; landmarker = await createLandmarker(); }
   } catch (e) {
     err.textContent = (e.name === "NotAllowedError" ? "カメラの使用が許可されませんでした。ブラウザの設定で許可してください。" : "起動に失敗しました: ") + (e.message || e);
-    $("startBtn").disabled = $("resumeBtn").disabled = false; return;
+    $("startBtn").disabled = $("calStartBtn").disabled = false; return;
   }
   keepAwake();
   $("start").classList.remove("show");
   requestAnimationFrame(loop);
   render();
-  if (useSaved && savedModel()) { model = savedModel(); mode = "board"; lastT = performance.now(); toast("前回の調整を使っています。ずれる場合は「再調整」"); }
-  else await calibrate();
+  model = savedModel(); // 回帰方式用（あれば）
+  refitAdaptive();
+  if (doCalib) await calibrate();
+  else {
+    mode = "board"; lastT = performance.now(); resetFilters();
+    toast(gazeReady() ? `前回までの学習（タップ${adapt.nTap}件）を使っています。タップするたびに精度が上がります`
+      : `ボタンを見ながらタップして使ってください。視線を学習し、あと${Math.max(0, ADAPT.readyTaps - adapt.nTap)}回ほどで見つめての選択がオンになります`, 6000);
+  }
 }
 
 function savedModel() {
@@ -792,8 +943,8 @@ function segment(el, values, labels, get, set) {
   el.onclick = e => { const b = e.target.closest("button"); if (!b) return; set(b.dataset.v); sync(); };
   sync(); return sync;
 }
-segment($("estSeg"), ["reg", "geo"], ["回帰（従来）", "幾何モデル"], () => est, v => {
-  if (v === "geo" && model && !model.geo?.mean) { toast("幾何モデルを使うには「再調整」が必要です"); }
+segment($("estSeg"), ["geo", "reg"], ["自動学習（幾何）", "回帰（要調整）"], () => est, v => {
+  if (v === "reg" && !model) { toast("回帰方式を使うには「再調整」でしっかり調整してください"); }
   est = v; store.set("est", est); resetFilters();
 });
 segment($("dwellSeg"), DWELLS, DWELLS.map(v => `${v / 1000}秒`), () => dwellMs, v => { dwellMs = Number(v); store.set("dwellMs", dwellMs); });
@@ -815,9 +966,18 @@ for (const [id, k, fmt] of TUNE_UI) $(id).addEventListener("input", e => {
 });
 $("tFx").onchange = e => { tune.flipX = e.target.checked; store.set("tune", tune); };
 $("tFy").onchange = e => { tune.flipY = e.target.checked; store.set("tune", tune); };
+let learnArm = 0;
+$("learnReset").onclick = () => { // 誤タップ防止に2回押しで実行
+  if (performance.now() - learnArm < 3000) { resetLearning(); learnArm = 0; $("learnReset").textContent = "学習をリセット"; toast("学習をリセットしました"); updateLearnInfo(); return; }
+  learnArm = performance.now(); $("learnReset").textContent = "もう一度押すとリセット";
+  setTimeout(() => { $("learnReset").textContent = "学習をリセット"; }, 3000);
+};
+function updateLearnInfo() {
+  $("learnInfo").textContent = adapt ? `タップ ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}。持ち方や場所が大きく変わってずれる場合はリセットしてください。` : "";
+}
 $("tuneReset").onclick = () => { tune = { ...TUNE_DEF }; store.set("tune", tune); syncTune(); };
 function afterPanel() { lockUntil = performance.now() + 600; if (!showDot && !tuning && !measuring) dotEl.style.display = "none"; }
-function setTuning(on) { tuning = on; $("tune").classList.toggle("show", on); if (on) setMeasuring(false); else afterPanel(); }
+function setTuning(on) { tuning = on; $("tune").classList.toggle("show", on); if (on) { setMeasuring(false); updateLearnInfo(); } else afterPanel(); }
 function setMeasuring(on) {
   measuring = on; $("measure").classList.toggle("show", on);
   if (on) { setTuning(false); gfx.reset(); gfy.reset(); drawMeasure.t = 0; drawMeasure(lastG, performance.now()); }
@@ -832,25 +992,25 @@ $("measureClose").onclick = () => setMeasuring(false);
 const GEO_UI = [["gFov", "fov", v => `${v}°`], ["gW", "screenW", v => `${v.toFixed(1)}cm`], ["gCam", "camY", v => `${v.toFixed(1)}cm`]];
 for (const [id, k, fmt] of GEO_UI) {
   $(id).value = geo[k]; $(id + "V").textContent = fmt(geo[k]);
-  $(id).addEventListener("input", e => { geo[k] = Number(e.target.value); $(id + "V").textContent = fmt(geo[k]); store.set("geo", geo); });
+  $(id).addEventListener("input", e => { geo[k] = Number(e.target.value); $(id + "V").textContent = fmt(geo[k]); store.set("geo", geo); refitAdaptive(); });
 }
 
 $("startBtn").onclick = () => boot(false);
-$("resumeBtn").onclick = () => boot(true);
+$("calStartBtn").onclick = () => boot(true);
 $("recalBtn").onclick = () => { if (mode === "board") { setTuning(false); setMeasuring(false); calibrate(); } };
 addEventListener("resize", () => {
   measure();
+  refitAdaptive();
   if (model && mode === "board" && (Math.abs(model.w - innerWidth) > 40 || Math.abs(model.h - innerHeight) > 80))
     toast("画面サイズが変わりました。「再調整」してください", 4000);
 });
 $("verStart").textContent = APP_VERSION;
 $("status").textContent = APP_VERSION;
 syncTune();
-if (savedModel()) $("resumeBtn").style.display = "";
-renderMsg(); render();
+renderMsg(); render(); refitAdaptive();
 
 // テスト用に公開
-window.__gaze = { fitAll, geoFeat, medianVec, PoseStabilizer, SMOOTH, jitStd, cellAtSticky, getRects: () => rects, applyTune, getTune: () => tune, fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features, geometry, geoToCss, drawMeasure,
+window.__gaze = { fitAdaptive, predictAdaptive, adaptFeat, sampleFromBuffer, screenEnv, ADAPT, addSamples, getAdapt: () => adapt, gazeReady, learnFromTap, getPool: () => pool, fitAll, geoFeat, medianVec, PoseStabilizer, SMOOTH, jitStd, cellAtSticky, getRects: () => rects, applyTune, getTune: () => tune, fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features, geometry, geoToCss, drawMeasure,
   setMeasuring, setModel: m => { model = m; mode = "board"; }, onGaze };
 </script>
 </body>
