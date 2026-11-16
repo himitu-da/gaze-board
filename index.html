@@ -58,7 +58,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 #mstats dd{margin:0}
 #mcanvas{width:100%;height:220px;display:block;background:#0b0e13;border:1px solid var(--cell-b);border-radius:10px}
 
-#grid{flex:1;display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);gap:8px;padding:8px}
+#grid{flex:1;display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(4,1fr);gap:8px;padding:8px}
 .cell{position:relative;overflow:hidden;background:var(--cell);border:3px solid var(--cell-b);border-radius:16px;
   display:flex;align-items:center;justify-content:center;text-align:center;font-size:clamp(18px,6.2vw,36px);font-weight:700;padding:4px;--p:0}
 .cell::before{content:"";position:absolute;left:0;right:0;bottom:0;height:calc(var(--p) * 100%);background:rgba(62,166,255,.38)}
@@ -151,7 +151,8 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
   <h1>視線入力ボード <span class="ver" id="verStart"></span></h1>
   <ul>
     <li>明るい場所で、スマホを<b>縦向き</b>で顔の正面 30〜40cm に<b>固定</b>してください（スタンドや物に立てかける）。</li>
-    <li><b>調整なしですぐ使えます。</b>ボタンを<b>見ながらタップ</b>すると、そのたびに視線を学習して精度が上がります（電車内でもOK）。数回タップすると、見つめるだけで選べるようになります。</li>
+    <li>最初に5つの点を見るだけ（約6秒）で始められます。電車内でもOK。</li>
+    <li>ボタンを<b>見つめると選択</b>されます。選ぶたびに視線を学習して、だんだん合ってきます。間違えて選ばれたら「⌫」や「◀ 戻る」で直すと、その学習は取り消されます。</li>
     <li>落ち着いた場所では「しっかり調整」もできます（13点＋顔を動かす）。結果は自動学習にも使われます。</li>
     <li>上の文字欄を見ている間は何も選ばれません。</li>
     <li>「📐 計測」で顔の角度・距離・視線の向きを確認できます。</li>
@@ -171,13 +172,15 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
 
 <script type="module">
 // ---------------- 設定 ----------------
-const APP_VERSION = "v1.5.0";
+const APP_VERSION = "v1.6.0";
 const VER = "0.10.14";
 const LIB = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const WASM = `${LIB}/wasm`;
 const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
 const DWELLS = [800, 1200, 1600, 2000];
-const SNAKE = [0, 1, 2, 5, 4, 3, 6, 7, 8];          // キャリブレーション順
+const COLS = 3, ROWS = 4;
+// キャリブレーション順（蛇行）
+const SNAKE = Array.from({ length: ROWS }, (_, r) => { const row = Array.from({ length: COLS }, (_, c) => r * COLS + c); return r % 2 ? row.reverse() : row; }).flat();
 const FLOOR = [.02, .02, .02, .02, .03, .03, .03, .03, .01]; // 特徴量ごとの標準偏差の下限
 const IRIS_CM = 1.17;  // 虹彩の直径（ほぼ個人差なし）
 const EYE_R_CM = 1.2;  // 眼球の回転半径
@@ -382,30 +385,24 @@ function cycleLast(text) {
   return text.slice(0, -1) + s[(s.indexOf(ch) + 1) % s.length];
 }
 
-const ph = t => ({ label: t, act: "phrase", val: t });
 const ctl = (label, act, val) => ({ label, act, val, cls: "ctl" });
 const EMPTY = { label: "", act: null, cls: "empty" };
 const MOD = ctl("゛ ゜ 小", "mod"), BS = ctl("⌫ 1字消す", "bs"), SPEAK = ctl("🔊 読み上げ", "speak");
+const kch = c => ({ label: c, act: "char", val: c, cls: "kana" });
 
+// 3列×4段。メイン：あかさ／たなは／まやら／わ ⌫ 🔊。行を選ぶとその行の文字。
 function cellsFor(v) {
-  if (v.type === "phrase" && v.page === 0) return [ph("はい"), ph("いいえ"), ph("ありがとう"), ph("痛い"), ph("トイレ"), ph("助けて"),
-    ctl("あいう 文字入力", "go", { type: "kanaG", page: 0 }), SPEAK, ctl("次へ ▶", "go", { type: "phrase", page: 1 })];
-  if (v.type === "phrase") return [ph("暑い"), ph("寒い"), ph("ちょっと待って"), ph("水がほしい"), ph("眠い"), ph("大丈夫"),
-    ph("人を呼んで"), ctl("✕ 消す", "clear"), ctl("◀ 戻る", "go", { type: "phrase", page: 0 })];
-  if (v.type === "kanaG" && v.page === 0) return [..."あかさたなはまや"].map(g => ({ label: g, act: "go", val: { type: "kana", g }, cls: "kana" }))
-    .concat(ctl("ら わ ー ▶", "go", { type: "kanaG", page: 1 }));
-  if (v.type === "kanaG") return [{ label: "ら", act: "go", val: { type: "kana", g: "ら" }, cls: "kana" },
-    { label: "わ", act: "go", val: { type: "kana", g: "わ" }, cls: "kana" }, { label: "ー", act: "char", val: "ー", cls: "kana" },
-    MOD, BS, SPEAK, ctl("✕ 全消去", "clear"), ctl("定型文", "go", { type: "phrase", page: 0 }), ctl("◀ 戻る", "go", { type: "kanaG", page: 0 })];
-  // かなの行
-  const chars = [...KANA[v.g]].map(c => ({ label: c, act: "char", val: c, cls: "kana" }));
+  if (v.type !== "kana") return [..."あかさたなはまやらわ"].map(g => ({ label: g, act: "go", val: { type: "kana", g }, cls: "kana" }))
+    .concat(BS, SPEAK);
+  const chars = [...KANA[v.g]].map(kch);
   while (chars.length < 5) chars.push(EMPTY);
-  return [...chars, MOD, BS, SPEAK, ctl("◀ 戻る", "go", { type: "kanaG", page: 0 })];
+  return [...chars, MOD, kch("ー"), { label: "空白", act: "char", val: "　", cls: "ctl" }, ctl("✕ 全消去", "clear"),
+    ctl("◀ 戻る", "go", { type: "main" }), BS, SPEAK];
 }
 
 // ---------------- 状態 ----------------
 let landmarker = null, model = null, mode = "start";
-let view = { type: "phrase", page: 0 }, cells = [], rects = [];
+let view = { type: "main" }, cells = [], rects = [];
 let message = "";
 let dwellMs = store.get("dwellMs") || 1200, showDot = store.get("showDot") ?? true;
 let est = store.get("est") || "geo";
@@ -473,8 +470,7 @@ function render() {
     const el = document.createElement("div");
     el.className = "cell " + (c.cls || "");
     el.innerHTML = `<span>${c.label}</span>`;
-    el.addEventListener("pointerdown", () => c.act && learnFromTap(i)); // タップ＝そこを見ていた → 学習
-    el.addEventListener("pointerup", () => c.act && activate(i));       // タップでも操作可能
+    el.addEventListener("pointerup", () => c.act && activate(i)); // 困ったときはタップでも操作可能
     grid.appendChild(el);
   });
   dwell.idx = null; dwell.p = 0;
@@ -498,12 +494,12 @@ function cellAt(x, y) {
 
 function activate(i) {
   const c = cells[i]; if (!c?.act) return;
+  checkUndo(c);
   const el = grid.children[i];
   el?.classList.remove("fire"); void el?.offsetWidth; el?.classList.add("fire");
   navigator.vibrate?.(30);
   switch (c.act) {
-    case "phrase": message = c.val; speak(c.val); break;
-    case "char": message += c.val; speak(c.val); if (view.type === "kana") view = { type: "kanaG", page: 0 }; break;
+    case "char": message += c.val; if (c.val.trim()) speak(c.val); view = { type: "main" }; break;
     case "mod": message = cycleLast(message); break;
     case "bs": message = [...message].slice(0, -1).join(""); break;
     case "clear": message = ""; break;
@@ -511,12 +507,13 @@ function activate(i) {
     case "go": view = c.val; break;
   }
   renderMsg();
-  if (c.act === "go" || (c.act === "char" && view.type === "kanaG")) setTimeout(render, 150);
+  if (c.act === "go" || c.act === "char") setTimeout(render, 150);
   lockUntil = performance.now() + 700;
 }
 
-// ---------------- 自動キャリブレーション（タップで学習） ----------------
-/* タップした瞬間はそのボタンの中心を見ていると仮定し、直前の視線データを正解として蓄積する。
+// ---------------- 自動キャリブレーション（見つめて選ぶたびに学習） ----------------
+/* 見つめて選択したとき、そのボタンの中心を見ていたと仮定し、選択直前の視線データを正解として蓄積する。
+   選択の直後に「⌫」「◀ 戻る」で取り消された場合は、誤選択とみなしてその学習を取り消す。
    モデル：幾何モデルの注視点(cm)・顔の角度 → 画面px。
    ・物理的な初期値（画面幅・カメラ画角から計算）に向けて正則化するので、学習0件でも動き、少数のタップでも暴れない
    ・形（感度・端の縮み・角度によるずれ）は全データで共有し、位置（切片）は使用セッションごとに持つ
@@ -524,11 +521,10 @@ function activate(i) {
 const ADAPT = {
   noise: 40,        // 1回のタップの想定誤差(px)
   maxSamples: 120,  // 保存する最大件数
-  halfLife: 40,     // タップの重みが半分になる件数
-  recentN: 6,       // 位置のずれを推定する直近タップ数
-  readyTaps: 8,     // 視線での選択をオンにするタップ数
-  readyCells: 4,    // そのうち異なるボタンの数
-  win: [450, 80],   // タップの何ms前〜何ms前の視線を使うか
+  halfLife: 40,     // 選択の重みが半分になる件数
+  recentN: 6,       // 位置のずれを推定する直近の選択数
+  gazeW: 0.6,       // 見つめて選んだデータの重み（調整データ＝1）
+  undoMs: 5000,     // この時間内に取り消されたら誤選択とみなす
   maxSpread: 2.0,   // その間の視線のばらつき（中央値からの距離の中央値, cm）の上限。超えたら揺れていたとみなして捨てる
   newSessionGap: 15 * 60 * 1000,
 };
@@ -553,15 +549,16 @@ function ridgePrior(rows, ys, ws, b0, sd, noise) {
 }
 function fitAdaptive(pool, env, curSid) {
   const pr = adaptPrior(env), K = 7;
-  const taps = pool.filter(s => s.src === "tap");
+  const taps = pool.filter(s => s.src !== "cal");
   const info = { n: pool.length, nTap: taps.length, cells: new Set(taps.map(s => `${Math.round(s.x)},${Math.round(s.y)}`)).size,
     hasCal: pool.some(s => s.src === "cal") };
   if (!pool.length) return { sx: pr.x.b, sy: pr.y.b, ix: pr.x.i, iy: pr.y.i, off: [0, 0], ...info };
   const sids = [...new Set(pool.map(s => s.sid))], S = sids.length, si = new Map(sids.map((s, i) => [s, i]));
   const rows = pool.map(s => { const r = [...adaptFeat(s.g, s.hp, env), ...Array(S).fill(0)]; r[K + si.get(s.sid)] = 1; return r; });
   // 重み：タップは新しいほど重い
-  const age = []; for (let i = pool.length - 1, k = 0; i >= 0; i--) age[i] = pool[i].src === "tap" ? k++ : 0;
-  const base = pool.map((s, i) => (s.w ?? 1) * (s.src === "tap" ? Math.pow(0.5, age[i] / ADAPT.halfLife) : 1));
+  // 古いデータほど軽く（調整データも、その後の選択が増えるにつれて軽くなる）
+  const age = []; for (let i = pool.length - 1, k = 0; i >= 0; i--) { age[i] = k; if (pool[i].src !== "cal") k++; }
+  const base = pool.map((s, i) => (s.w ?? 1) * Math.pow(0.5, age[i] / ADAPT.halfLife));
   const xs = pool.map(s => s.x), ys = pool.map(s => s.y);
   const b0 = ax => [...pr[ax].b, ...Array(S).fill(pr[ax].i)], sd = ax => [...pr[ax].sd, ...Array(S).fill(300)];
   let ws = base, bx, by;
@@ -581,7 +578,7 @@ function fitAdaptive(pool, env, curSid) {
   // 直近のタップから位置のずれ（持ち替え）を推定：残差の中央値を件数に応じて控えめに
   const recent = [];
   for (let i = pool.length - 1; i >= 0 && recent.length < ADAPT.recentN; i--) {
-    const s = pool[i]; if (s.src !== "tap" || s.sid !== curSid) continue;
+    const s = pool[i]; if (s.src === "cal" || s.sid !== curSid) continue;
     const h = adaptFeat(s.g, s.hp, env);
     recent.push([s.x - (ix + dotv(h, bx)), s.y - (iy + dotv(h, by))]);
   }
@@ -603,44 +600,53 @@ let pool = loadPool(), adapt = null;
 let session = Date.now();
 function refitAdaptive() { adapt = fitAdaptive(pool, screenEnv(), session); }
 function addSamples(list) {
-  const last = pool.filter(s => s.src === "tap").at(-1);
+  const last = pool.at(-1);
   if (last && Date.now() - last.t > ADAPT.newSessionGap && last.sid === session) session = Date.now(); // 長く空いたら新しいセッション
-  const wasReady = gazeReady();
-  pool.push(...list.map(s => ({ ...s, sid: session, t: Date.now() })));
+  const added = list.map(s => ({ ...s, sid: session, t: Date.now(), id: Math.random().toString(36).slice(2) }));
+  pool.push(...added);
   if (pool.length > ADAPT.maxSamples) pool = pool.slice(-ADAPT.maxSamples);
-  store.set("adaptPool", { W: innerWidth, H: innerHeight, samples: pool });
-  refitAdaptive();
-  if (!wasReady && gazeReady()) toast("視線での選択をオンにしました");
+  savePoolAndRefit();
+  return added;
 }
-function gazeReady() {
-  if (est === "reg") return !!model;
-  return !!adapt && (adapt.hasCal || (adapt.nTap >= ADAPT.readyTaps && adapt.cells >= ADAPT.readyCells));
-}
+function savePoolAndRefit() { store.set("adaptPool", { W: innerWidth, H: innerHeight, samples: pool }); refitAdaptive(); }
+function removeSample(id) { const n = pool.length; pool = pool.filter(s => s.id !== id); if (pool.length !== n) savePoolAndRefit(); }
+function gazeReady() { return est === "reg" ? !!model : !!adapt; }
 
-// タップ直前の視線を記録しておくリングバッファ
+// 直前の視線を記録しておくリングバッファ
 const obsBuf = [];
 let openRef = null;
 function recordObs(t, F, G) {
   openRef = openRef === null ? F.open : (F.open > openRef * 0.6 ? openRef + 0.02 * (F.open - openRef) : openRef);
   if (!G.ok) return;
   obsBuf.push({ t, g: [G.gx, G.gy], hp: G.rel, open: F.open });
-  while (obsBuf.length && obsBuf[0].t < t - 1500) obsBuf.shift();
+  while (obsBuf.length && obsBuf[0].t < t - 3000) obsBuf.shift();
 }
-// タップ時：そのボタンの中心を見ていたとみなして学習。揺れていた・瞬きしていた場合は捨てる
-function sampleFromBuffer(buf, t, ref) {
-  const win = buf.filter(o => o.t >= t - ADAPT.win[0] && o.t <= t - ADAPT.win[1] && (ref === null || o.open > ref * 0.55));
+// 時刻 t0〜t1 の視線の中央値。揺れていた・瞬きしていた場合は null（学習しない）
+function sampleFromBuffer(buf, t0, t1, ref) {
+  const win = buf.filter(o => o.t >= t0 && o.t <= t1 && (ref === null || o.open > ref * 0.55));
   if (win.length < 4) return null;
   const m = medianVec(win.map(o => o.g));
   const d = win.map(o => Math.hypot(o.g[0] - m[0], o.g[1] - m[1])).sort((a, b) => a - b);
   if (d[d.length >> 1] > ADAPT.maxSpread) return null;
   return { g: m, hp: medianVec(win.map(o => o.hp)) };
 }
-function learnFromTap(i) {
-  if (mode !== "board" || tuning || measuring) return;
+// 見つめて選択したとき：選択までの見つめていた間の視線を、そのボタンの中心に対応づけて学習
+let pendingLearn = null;
+function learnFromGaze(i, t) {
+  pendingLearn = null;
+  if (est !== "geo") return;
   const r = rects[i]; if (!r) return;
-  const s = sampleFromBuffer(obsBuf, performance.now(), openRef);
+  const s = sampleFromBuffer(obsBuf, t - dwellMs * 0.8, t - 50, openRef);
   if (!s) return;
-  addSamples([{ ...s, x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2, src: "tap" }]);
+  const [added] = addSamples([{ ...s, x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2, src: "gaze", w: ADAPT.gazeW }]);
+  pendingLearn = { id: added.id, t, act: cells[i].act };
+}
+// 直前の学習が誤選択だったか：文字を入れた直後の「⌫」、行を開いた直後の「◀ 戻る」
+function checkUndo(c) {
+  const p = pendingLearn; pendingLearn = null;
+  if (!p || performance.now() - p.t > ADAPT.undoMs) return;
+  const undo = (p.act === "char" && c.act === "bs") || (p.act === "go" && c.act === "go" && c.val?.type === "main");
+  if (undo) removeSample(p.id);
 }
 function resetLearning() { pool = []; store.set("adaptPool", null); session = Date.now(); refitAdaptive(); }
 
@@ -677,7 +683,11 @@ function onGaze(F, G, t) {
   if (idx !== null && idx === dwell.idx) dwell.p += dt;
   else { dwell.p -= dt * 1.5; if (dwell.p <= 0) { dwell.idx = idx; dwell.p = 0; } }
   setHot(dwell.idx, dwell.p / dwellMs);
-  if (dwell.idx !== null && dwell.p >= dwellMs) { const i = dwell.idx; dwell.idx = null; dwell.p = 0; setHot(null, 0); activate(i); }
+  if (dwell.idx !== null && dwell.p >= dwellMs) {
+    const i = dwell.idx; dwell.idx = null; dwell.p = 0; setHot(null, 0);
+    activate(i);          // 前回の選択の取り消し判定もここで行う
+    learnFromGaze(i, t);  // 今回の選択を学習
+  }
 }
 
 function onNoFace(t) {
@@ -704,7 +714,7 @@ function drawMeasure(G, t) {
   st.innerHTML = [
     ["距離", `${G.D.toFixed(1)} cm`],
     ["顔の向き", `${fmtLR(G.yaw)}／${fmtUD(G.pitch)}`],
-    ["学習データ", adapt ? `タップ ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}（${gazeReady() ? "視線選択オン" : "視線選択オフ"}）` : "—"],
+    ["学習データ", adapt ? `見つめて選択 ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}` : "—"],
     ["顔の傾き", `${fmtLR(G.roll, "時計回り", "反時計回り")}`],
     ["目の回転", `${fmtLR(G.eyeH)}／${fmtUD(-G.eyeV)}`],
     ["視線（合計）", `${fmtLR(gazeYaw)}／${fmtUD(gazePitch)}`],
@@ -768,7 +778,7 @@ function loop() {
   const lm = res.faceLandmarks?.[0];
   faceOk = !!lm && lm.length >= 478;
   video.className = faceOk ? "ok" : "ng";
-  $("status").textContent = `${APP_VERSION}\n${faceOk ? "顔OK" : "顔なし"} ${fps}fps` + (est === "geo" && adapt ? ` 学習${adapt.nTap}${gazeReady() ? "" : "（タップで学習）"}` : "");
+  $("status").textContent = `${APP_VERSION}\n${faceOk ? "顔OK" : "顔なし"} ${fps}fps` + (est === "geo" && adapt ? ` 学習${adapt.nTap}` : "");
   if (!faceOk) { lastG = null; stab.reset(); drawMeasure(null, t); dot2El.style.display = "none"; return onNoFace(t); }
   const vw = video.videoWidth, vh = video.videoHeight;
   const F = features(lm, vw, vh), G = geometry(lm, vw, vh, geo, stab, SMOOTH[mode === "calib" ? 0 : smoothLv]);
@@ -836,9 +846,40 @@ async function collectHead(x, y) {
   return out;
 }
 
+// 起動時の簡単な位置合わせ：中央と四隅のマスの5点を1点約1.2秒ずつ見る（電車内でもできる長さ）
+// 揺れていた点は自動で捨てる。顔が映らない・タップした場合は飛ばす
+async function quickAlign() {
+  mode = "calib";
+  const scr = $("calib"), tg = $("target"), msg = $("calibMsg");
+  const ctr = i => [(rects[i].left + rects[i].right) / 2, (rects[i].top + rects[i].bottom) / 2];
+  const n = rects.length, mid = [rects.reduce((a, r) => a + (r.left + r.right) / 2, 0) / n, rects.reduce((a, r) => a + (r.top + r.bottom) / 2, 0) / n];
+  const pts = [mid, ctr(0), ctr(COLS - 1), ctr(n - 1), ctr(n - COLS)];
+  const moveTo = ([x, y]) => { tg.classList.remove("collect"); tg.style.left = x + "px"; tg.style.top = y + "px"; };
+  tg.style.transition = "none"; moveTo(pts[0]); void tg.offsetWidth; tg.style.transition = "";
+  scr.classList.add("show");
+  let skip = false; scr.onclick = () => { skip = true; };
+  const t0 = performance.now();
+  while (!faceOk && !skip && performance.now() - t0 < 6000) { msg.textContent = "顔をカメラに映してください（タップで飛ばす）"; await wait(100); }
+  const got = [];
+  for (let k = 0; k < pts.length && faceOk && !skip; k++) {
+    moveTo(pts[k]);
+    msg.textContent = `赤い点を見てください（${k + 1}/${pts.length}）`;
+    await wait(k ? 650 : 500);
+    tg.classList.add("collect");
+    const t1 = performance.now();
+    while (performance.now() - t1 < 700 && !skip) await wait(40);
+    const s = sampleFromBuffer(obsBuf, t1, performance.now(), openRef);
+    if (s) got.push({ ...s, x: pts[k][0], y: pts[k][1], src: "cal", w: 2 });
+  }
+  if (got.length) addSamples(got);
+  scr.onclick = null; scr.classList.remove("show"); tg.classList.remove("collect");
+  resetFilters(); lastT = performance.now(); lockUntil = lastT + 800;
+  mode = "board";
+}
+
 async function calibrate() {
   mode = "calib"; dotEl.style.display = "none";
-  view = view.type === "kana" ? { type: "kanaG", page: 0 } : view; render();
+  view = { type: "main" }; render();
   const centers = rects.map(r => [(r.left + r.right) / 2, (r.top + r.bottom) / 2]);
   const inset = Math.max(24, Math.min(innerWidth, innerHeight) * 0.06);
   const corners = [[inset, inset], [innerWidth - inset, inset], [innerWidth - inset, innerHeight - inset], [inset, innerHeight - inset]];
@@ -925,9 +966,8 @@ async function boot(doCalib) {
   refitAdaptive();
   if (doCalib) await calibrate();
   else {
-    mode = "board"; lastT = performance.now(); resetFilters();
-    toast(gazeReady() ? `前回までの学習（タップ${adapt.nTap}件）を使っています。タップするたびに精度が上がります`
-      : `ボタンを見ながらタップして使ってください。視線を学習し、あと${Math.max(0, ADAPT.readyTaps - adapt.nTap)}回ほどで見つめての選択がオンになります`, 6000);
+    await quickAlign();
+    toast("見つめて選ぶたびに視線を学習して、だんだん合ってきます。\n間違えて選ばれたら「⌫」や「◀ 戻る」で直すと、その学習は取り消されます", 6500);
   }
 }
 
@@ -973,7 +1013,7 @@ $("learnReset").onclick = () => { // 誤タップ防止に2回押しで実行
   setTimeout(() => { $("learnReset").textContent = "学習をリセット"; }, 3000);
 };
 function updateLearnInfo() {
-  $("learnInfo").textContent = adapt ? `タップ ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}。持ち方や場所が大きく変わってずれる場合はリセットしてください。` : "";
+  $("learnInfo").textContent = adapt ? `見つめて選択 ${adapt.nTap}件・ボタン${adapt.cells}種類${adapt.hasCal ? "・調整データあり" : ""}。持ち方や場所が大きく変わってずれる場合はリセットしてください。` : "";
 }
 $("tuneReset").onclick = () => { tune = { ...TUNE_DEF }; store.set("tune", tune); syncTune(); };
 function afterPanel() { lockUntil = performance.now() + 600; if (!showDot && !tuning && !measuring) dotEl.style.display = "none"; }
@@ -1010,7 +1050,7 @@ syncTune();
 renderMsg(); render(); refitAdaptive();
 
 // テスト用に公開
-window.__gaze = { fitAdaptive, predictAdaptive, adaptFeat, sampleFromBuffer, screenEnv, ADAPT, addSamples, getAdapt: () => adapt, gazeReady, learnFromTap, getPool: () => pool, fitAll, geoFeat, medianVec, PoseStabilizer, SMOOTH, jitStd, cellAtSticky, getRects: () => rects, applyTune, getTune: () => tune, fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features, geometry, geoToCss, drawMeasure,
+window.__gaze = { fitAdaptive, predictAdaptive, adaptFeat, sampleFromBuffer, screenEnv, ADAPT, addSamples, getAdapt: () => adapt, gazeReady, learnFromGaze, checkUndo, removeSample, recordObs, getPool: () => pool, fitAll, geoFeat, medianVec, PoseStabilizer, SMOOTH, jitStd, cellAtSticky, getRects: () => rects, applyTune, getTune: () => tune, fitModel, predict, trimSamples, cycleLast, cellsFor, OneEuro, features, geometry, geoToCss, drawMeasure,
   setMeasuring, setModel: m => { model = m; mode = "board"; }, onGaze };
 </script>
 </body>
